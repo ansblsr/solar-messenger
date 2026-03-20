@@ -1,0 +1,3 @@
+/.vscode
+/arduino/libraries/
+arduino/Shared/arduino_secrets.h
