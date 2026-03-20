@@ -4,7 +4,6 @@
 #include <HTTPClient.h>
 #include <SD.h>
 #include <SPI.h>
-//#include <Audio.h>
 #include <ArduinoJson.h>
 #include <driver/i2s_std.h>
 #include "freertos/FreeRTOS.h"
@@ -21,8 +20,6 @@
 // ------------------------------
 
 // KONFIGURATION 
-
-
 int chat_index = 0;
 bool newMessages[max_chats] = {false};
 
@@ -166,6 +163,9 @@ void handleButton(Button &btn, const char* name) {
   btn.lastState = currentState;
 }
 
+// ------------------------------
+// LOGIC: TELEGRAM & PLAYBACK
+// ------------------------------
 void playNewMessage() {
     if(audio.isRunning()) return;
 
@@ -247,7 +247,7 @@ void cleanupChatFolder(const char* folderPath, const char* prefix) {
 
             // Check if the filename starts with the required prefix
             if (strncmp(name, prefix, strlen(prefix)) == 0) {
-                char filePath[64];
+                char filePath[MAX_PATH_LEN];
                 snprintf(filePath, sizeof(filePath), "%s/%s", folderPath, name);
                 SD.remove(filePath);
             }
@@ -268,8 +268,9 @@ int findChatId(const char* chatId) {
   return -1;
 }
 
-// --- TRANSCODING (OFFLINE PROCESS) ---
-
+// ------------------------------
+// AUDIO TRANSCODING
+// ------------------------------
 bool transcodeOggToWav(const char* oggPath, const char* wavPath) {
     Serial.println("[TRANSCODE] Starting OGG/Opus to WAV...");
     
@@ -286,7 +287,7 @@ bool transcodeOggToWav(const char* oggPath, const char* wavPath) {
 
     // We use '::audio_tools' to force the compiler to look at the 
     // root namespace and ignore the 'ambiguous' nested ones.
-    
+
     ::audio_tools::OpusOggDecoder opusDecoder;
     ::audio_tools::WAVEncoder wavEncoder;
     
@@ -320,10 +321,9 @@ bool transcodeOggToWav(const char* oggPath, const char* wavPath) {
     return true;
 }
 
-// SENDING 
-
-// --- I2S MANAGEMENT ---
-
+// ------------------------------
+// I2S & RECORDING
+// ------------------------------
 void setupI2S_record() {
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   i2s_new_channel(&chan_cfg, NULL, &rx_handle);
@@ -352,20 +352,12 @@ void stopI2S_record() {
   }
 }
 
-// --- AUDIO AUFNAHME ---
-
 void startRecording() {
-  if (audio.isRunning()) audio.stopSong();
-
+  if (isAudioRunning) stopPlayback();
   const char* chatId = getChatId();
-
   char folderPath[24]; snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
-  if (!SD.exists(folderPath)) {
-    if (!SD.mkdir(folderPath)) {
-      Serial.println("[ERROR] Failed to create directory on SD");
-      return;
-    }
-  }
+  
+  if (!SD.exists(folderPath)) SD.mkdir(folderPath);
 
   // Clear previously recorded messages so they don't pile up
   cleanupChatFolder(folderPath, "recorded_");
@@ -422,7 +414,7 @@ void finishRecording() {
   audioFile.seek(0);
   writeWavHeader(audioFile, bytesRecorded);
   audioFile.close();
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
 
   Serial.println("Aufnahme beendet. Senden wird vorbereitet...");
   sendWavFile(currentFilePath, "message.wav", getChatId());
@@ -452,8 +444,9 @@ void writeWavHeader(File file, uint32_t fileSize) {
   file.write((const uint8_t*)&fileSize, 4);
 }
 
-// --- TELEGRAM UPLOAD ---
-
+// ------------------------------
+// TELEGRAM COMMS
+// ------------------------------
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id) {
   File f = SD.open(filePath);
   if (!f) {
@@ -546,22 +539,22 @@ bool processTelegramUpdates() {
 
                 char chatId_str[14]; snprintf(chatId_str, sizeof(chatId_str), "%lld", chatId);
 
-                int chatIndex = -1;
+            int chatIndex = -1;
                 if(!isValidChat(chatId_str, &chatIndex)) {
                     Serial.println("[ERROR] chat id is unknown");
                     continue;
                 } 
 
-                if (message.containsKey("voice")) {
+            if (message.containsKey("voice")) {
                     Serial.println("Type: VoiceMessage");
-                    const char* fileId = message["voice"]["file_id"];
+                const char* fileId = message["voice"]["file_id"];
 
                     // Create directory if needed
                     char folderPath[32]; snprintf(folderPath, sizeof(folderPath), "/%lld", chatId); 
-                    if(!SD.exists(folderPath)) SD.mkdir(folderPath);
+                if(!SD.exists(folderPath)) SD.mkdir(folderPath);
 
                     // Remove all previously received messages (keeps SD clean)
-                    cleanupChatFolder(folderPath, "received_");
+                cleanupChatFolder(folderPath, "received_");
 
                     // Download raw Opus/OGG first
                     char oggFilePath[64];
@@ -572,19 +565,19 @@ bool processTelegramUpdates() {
                         // Set up target WAV file path
                         char wavFilePath[64];
                         snprintf(wavFilePath, sizeof(wavFilePath), "%s/received_%ld.wav", folderPath, lastUpdateId);
-                        
+
                         // Run Offline Transcode
                         if (transcodeOggToWav(oggFilePath, wavFilePath)) {
                             SD.remove(oggFilePath); // Delete original compressed file
-                            newMessages[chatIndex] = true;
-                            ret = true;
+                        newMessages[chatIndex] = true;
+                        ret = true;
                         } else {
                             Serial.println("[ERROR] Voice message decoding failed. Corrupt file?");
                             SD.remove(oggFilePath);
                             SD.remove(wavFilePath);
-                        }
-                    }
-                } 
+                }
+            } 
+        }
                 else if (message.containsKey("text")) {
                     const char* text = message["text"];
                     Serial.print("Type: Text -> Content: ");
@@ -641,7 +634,7 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
                     http_download.end();
                     http_getFile.end();
                     return true;
-                }
+            }
             }
             http_download.end();
         }
@@ -652,15 +645,40 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
     return false;
 }
 
-// --- PLAYBACK ---
-
-void startPlayback(char* filePath) {
-    Serial.println("Starting Playback...");
-    audio.connecttoFS(SD, filePath); // Playback starts
+// ------------------------------
+// MAIN PLAYBACK ENGINE
+// ------------------------------
+void startPlayback(const char* filePath) {
+    if (isAudioRunning) stopPlayback(); 
+    audioFile = SD.open(filePath);
+    if (!audioFile) return;
+    decoderStream.begin(); 
+    isAudioRunning = true;
 }
 
-// SETUP & LOOP 
+void stopPlayback() {
+    if (isAudioRunning) {
+        isAudioRunning = false;
+        if (audioFile) audioFile.close();
+        decoderStream.flush(); 
+    }
+}
 
+void processAudio() {
+    if (!isAudioRunning) return;
+    if (audioFile && audioFile.available()) {
+        uint8_t buffer[512];
+        size_t bytesRead = audioFile.read(buffer, sizeof(buffer));
+        if (bytesRead > 0) decoderStream.write(buffer, bytesRead);
+    } else {
+        audioFile.close();
+        isAudioRunning = false;
+    }
+}
+
+// ------------------------------
+// SETUP & LOOP
+// ------------------------------
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -709,9 +727,7 @@ void setup() {
     }
 
     client_wifi.setInsecure(); 
-
-    audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-    audio.setVolume(50);
+    setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
 
     audioQueue = xQueueCreate(20, 64 * sizeof(int16_t));
     xTaskCreate(recordTask, "Capture", 4096, NULL, 5, NULL);
@@ -721,19 +737,26 @@ void setup() {
 }
 
 void loop() {
-    audio.loop();
-
+    processAudio();
     handleButton(button, "button");
     handleButton(button_dial, "dial");
 
-    if(!audio.isRunning() && playbackQueue.count > 0) {
+    if(!isAudioRunning && playbackQueue.count > 0) {
         static char filePlaying[MAX_PATH_LEN];
         playbackQueue.pop(filePlaying);
         startPlayback(filePlaying);
     }
 }
 
-// UTILITY 
+// UTILITY
+
+void setI2SPinout(int bclk, int lrck, int din) {
+    auto config = i2sOut.defaultConfig(TX_MODE);
+    config.pin_bck = bclk;
+    config.pin_ws = lrck;
+    config.pin_data = din;
+    i2sOut.begin(config);
+}
 
 bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
     for (int i = 0; i < max_chats; i++)
@@ -744,13 +767,4 @@ bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
         }
     }
     return false;
-}
-
-void audio_eof_mp3(const char *info){  // Wird am Ende einer Datei aufgerufen
-    Serial.print("Playback beendet.");
-    Serial.println(info);
-}
-
-void audio_info(const char *info){
-    Serial.print("audio_info: "); Serial.println(info);
 }
