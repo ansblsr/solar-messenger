@@ -6,38 +6,18 @@
 #include <SPI.h>
 #include <ArduinoJson.h>
 #include <driver/i2s_std.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-
-// --- NEW DECODING LIBRARIES ---
 #include "AudioTools.h"
-#include "AudioTools/AudioCodecs/CodecWAV.h"     // WAV encoding
-#include "AudioTools/AudioCodecs/CodecOpusOgg.h" // Combined Opus + OGG integration
+#include "AudioTools/AudioCodecs/CodecOpusOgg.h"
 
+// Bot Token, Chat-IDs, WiFi credentials
 #include "../Shared/arduino_secrets.h"
 
-// ------------------------------
+// ========================================================================================
 
-// KONFIGURATION 
-int chat_index = 0;
-bool newMessages[max_chats] = {false};
-
-// I2S Pins
-#define I2S_DOUT  8
-#define I2S_DIN   7
-#define I2S_BCLK  5
-#define I2S_LRC   6
-
-#define SAMPLE_RATE 16000
-
-// SD Card Pin
-#define SD_CS     D10
 
 // Buttons
 const unsigned long SHORT_PRESS_TIME = 500; // Threshold for long press
 
-using ButtonEvent = void (*)();
 
 // Forward Declarations
 void playNewMessage();
@@ -46,7 +26,7 @@ void finishRecording();
 void dialUp();
 void doNothing();
 void playLastMessagesWrapper();
-void playLastMessages(const char* chatId);
+void playLastMessages(const char* chatId, bool transcodeOgg);
 bool isValidChat(const char* chat_id, int* printIndex = nullptr);
 bool downloadTelegramFile(const char* fileId, const char* destination);
 bool transcodeOggToWav(const char* oggPath, const char* wavPath);
@@ -54,9 +34,32 @@ void cleanupChatFolder(const char* folderPath, const char* prefix);
 void writeWavHeader(File file, uint32_t fileSize);
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id);
 bool processTelegramUpdates();
-void startPlayback(char* filePath);
+void startPlayback(const char* filePath);
 const char* getChatId();
 int findChatId(const char* chatId);
+
+// ==========================================================================================
+
+// COMMUNICATION =======================
+
+// I2S Pins
+#define I2S_DOUT  8
+#define I2S_DIN   7
+#define I2S_BCLK  5
+#define I2S_LRC   6
+
+// SD Card Pin
+#define SD_CS     D10
+
+#define SAMPLE_RATE 16000
+
+
+// BUTTONS ==============================
+
+#define BUTTON A5
+#define BUTTON_DIAL A4
+
+using ButtonEvent = void (*)();
 
 struct Button {
   const int pin;
@@ -69,13 +72,11 @@ struct Button {
   ButtonEvent onRelease;
 };
 
-#define BUTTON A5
-#define BUTTON_DIAL A4
-
 Button button = {BUTTON, HIGH, 0, false, false, playNewMessage, startRecording, finishRecording};
 Button button_dial = {BUTTON_DIAL, HIGH, 0, false, false, dialUp, playLastMessagesWrapper, doNothing};
 
-// Playback Queue
+
+// PLAYBACK ==============================
 
 #define QUEUE_SIZE 5 // maximum expected number of files
 #define MAX_PATH_LEN 64 // maximum path length
@@ -85,6 +86,8 @@ struct PlaybackQueue {
     int head = 0; // Where we add new items
     int tail = 0; // Where we read items
     int count = 0; // Current number of items
+    int waitCount = 0; // how many files are we waiting on?
+    char waitingOnChatId [12] = "";
 
     bool push(const char* path) {
         if (count >= QUEUE_SIZE) return false; // Queue full
@@ -95,10 +98,12 @@ struct PlaybackQueue {
     }
 
     bool pop(char* dest) {
-        if (count == 0) return false; // Queue empty
+        if (!hasNext()) return false; // queue empty or waiting
+
         strncpy(dest, queue[tail], MAX_PATH_LEN);
         tail = (tail + 1) % QUEUE_SIZE;
         count--;
+
         return true;
     }
 
@@ -106,29 +111,217 @@ struct PlaybackQueue {
         head = 0;
         tail = 0;
         count = 0;
+
+        waitCount = 0;
+        snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", "");
+    }
+
+    bool hasNext() {
+        if(count > 0 && waitCount == 0) return true;
+        return false;
+    }
+
+    bool pushAndWaitFor(const char* path, const char* chatId) {
+        if(waitCount > 0 && strcmp(waitingOnChatId, chatId) != 0) return false;
+
+        if(push(path)) {
+            snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", chatId);
+            waitCount++;
+            return true;
+        }
+        return false;
+    }
+
+    void signalizeFileReady(const char* wavPath) {
+        if (strstr(wavPath, waitingOnChatId) != nullptr) waitCount--;
+        if (waitCount == 0) snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", "");
     }
 };
 
 PlaybackQueue playbackQueue;
 
-// Globals
-WiFiClientSecure client_wifi;
-Audio audio;
+int chat_index = 0;
+bool newMessages[max_chats] = {false};
 
-long lastUpdateId = 0;
-int messageCount = 0;
-i2s_chan_handle_t rx_handle = NULL;
+
+// Audio Player
+
+bool isAudioRunning = false;
+File audioFile;
+
+I2SStream i2s;
+WAVDecoder decoder_wav;
+EncodedAudioStream out_stream(&i2s, &decoder_wav); // data written to 'out_stream' gets decoded as WAV and sent to I2S.
+StreamCopy copier_playback(out_stream, audioFile); // pulls bytes from sd-file and pushes them to out_stream
+
+
+// RECORDING =========================
+
+volatile bool isRecording = false;
 
 QueueHandle_t audioQueue;
-volatile bool isRecording = false;
-File audioFile;
 char currentFilePath[64]; // where the file is stored, that is being recorded
 uint32_t bytesRecorded = 0;
 
-// BUTTON-CONTROL 
 
-// Helper function to prevent crash if an event is unassigned
-void doNothing() {}
+
+// TRANSCODING ============================
+// file.ogg --> OpusOggDecoder --StreamCopy--> WavEncoder --> File.wav
+
+// Struct to pass jobs to the FreeRTOS task
+struct TranscodeJob {
+    char inFile[MAX_PATH_LEN];
+    char outFile[MAX_PATH_LEN];
+};
+
+// Transcoding Queue
+QueueHandle_t jobQueue;
+TaskHandle_t transcodeTaskHandle = NULL;
+
+File audioFileIn;
+File audioFileOut;
+
+// Pipeline Components
+OpusOggDecoder decoder_opusOgg;
+WAVEncoder encoder_wav;
+
+EncodedAudioStream dec_stream(&audioFileIn, &decoder_opusOgg);
+EncodedAudioStream enc_stream(&audioFileOut, &encoder_wav);
+
+StreamCopy copier_transcode(enc_stream, dec_stream, 16384);
+
+
+// NETWORKING =========================
+
+WiFiClientSecure client_wifi;
+
+long lastUpdateId = 0;
+i2s_chan_handle_t rx_handle = NULL;
+
+
+
+// =============================================================================================
+// =============================================================================================
+
+
+
+// SETUP & LOOP =======================
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    // Pins
+    pinMode(BUTTON, INPUT_PULLUP);
+    pinMode(BUTTON_DIAL, INPUT_PULLUP);
+
+    AudioLogger::instance().begin(Serial, AudioLogger::Debug);
+    
+    Serial.println("\n[SYSTEM] Initializing...");
+    
+
+    // SD card mount
+    if (!SD.begin(SD_CS)) {
+        Serial.println("[CRITICAL] SD Card Mount Failed!");
+        while (1);
+    }
+    Serial.println("[OK] SD Card Initialized.");
+
+
+    // WiFi connection
+
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.print("[SYSTEM] Connecting to WiFi");
+    
+    unsigned long startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
+    }
+    else {
+        Serial.println("\n[OK] WiFi connected.");
+        
+
+        // Time syncing
+
+        Serial.println("[SYSTEM] Syncing time...");
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
+        
+        time_t now = time(nullptr);
+        int retry = 0;
+        while (now < 24 * 3600 && retry < 100) { 
+            delay(100); 
+            now = time(nullptr);
+            retry++;
+        }
+        
+        if (now < 24 * 3600) {
+            Serial.println("[WARNING] Time sync failed. SSL certificates might fail.");
+        } else {
+            Serial.println("[OK] Time synced.");
+        }
+    }
+
+    client_wifi.setInsecure(); 
+    setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+
+
+    // Audio Capture & Storage
+
+    audioQueue = xQueueCreate(20, 64 * sizeof(int16_t));
+    xTaskCreate(recordTask, "Capture", 4096, NULL, 5, NULL);
+    xTaskCreate(sdWriteTask, "Writer", 4096, NULL, 3, NULL);
+
+
+    // Audio Transcoding
+
+    AudioInfo info;
+    info.sample_rate = 48000;
+    info.channels = 1;
+    info.bits_per_sample = 16;
+
+    decoder_opusOgg.setAudioInfo(info);
+    encoder_wav.setAudioInfo(info);
+
+    // Create a queue capable of holding up to 5 pending transcode jobs
+    jobQueue = xQueueCreate(5, sizeof(TranscodeJob));
+
+    // Create the persistent FreeRTOS Task
+    xTaskCreatePinnedToCore(
+        transcodeTask,
+        "TranscodeTask",
+        16384,               // Ogg+Opus needs a hefty stack, bumped to 32k to be safe
+        NULL,
+        1,
+        &transcodeTaskHandle,
+        1                    // Pin to Core 1
+    );
+
+
+    Serial.println("[SYSTEM] Ready. Waiting for Telegram messages...");
+}
+
+void loop() {
+    processAudio();
+    handleButton(button, "button");
+    handleButton(button_dial, "dial");
+
+    if(!isAudioRunning && playbackQueue.hasNext()) {
+        static char filePlaying[MAX_PATH_LEN];
+        playbackQueue.pop(filePlaying);
+        startPlayback(filePlaying);
+    }
+}
+
+
+
+
+
+// USER CONTROL ==============================
 
 void handleButton(Button &btn, const char* name) {
   bool currentState = digitalRead(btn.pin);
@@ -163,33 +356,7 @@ void handleButton(Button &btn, const char* name) {
   btn.lastState = currentState;
 }
 
-// ------------------------------
-// LOGIC: TELEGRAM & PLAYBACK
-// ------------------------------
-void playNewMessage() {
-    if(audio.isRunning()) return;
-
-    // See if there are chats that have unlistened messages in them
-    int chatsWithNews = 0; // Number of chats with new messages
-    for(int i = 0; i < max_chats; i++) {
-        if(newMessages[i]) chatsWithNews++;
-    }
-
-    // If yes, pick a random one of them
-    if(chatsWithNews > 0) {
-        int chats_indices[max_chats];
-        int j = 0;
-        for(int i = 0; i < max_chats; i++) {
-            if(newMessages[i]) chats_indices[j++] = i;
-        }
-        int randomChatIndex = millis() % chatsWithNews;
-        playLastMessages(chat_ids[chats_indices[randomChatIndex]]);
-    } 
-    else {
-        if(processTelegramUpdates()) playNewMessage();
-        else Serial.println("[MESSAGE] No new messages :(");
-    }
-}
+void doNothing() {} // Helper function to prevent crash if an event is unassigned
 
 void dialUp() { 
     if(isRecording) return;
@@ -203,28 +370,85 @@ void dialUp() {
     Serial.println("");
 }
 
-void playLastMessagesWrapper() {
-  playLastMessages(getChatId());
+
+
+
+
+// CHAT & PLAYBACK CONTROL ==============================
+
+void playNewMessage() {
+    if(isAudioRunning) return;
+    if(isRecording) return;
+
+    // See if there already are chats that have unlistened messages in them
+    int chatsWithNews = 0; // Number of chats with new messages
+    for(int i = 0; i < max_chats; i++) {
+        if(newMessages[i]) chatsWithNews++;
+    }
+
+    // If yes, pick a random one of them
+    if(chatsWithNews > 0) {
+        int chats_indices[max_chats]; // will hold the chatIndices of all chats containing unlistened messages
+        int j = 0;
+        for(int i = 0; i < max_chats; i++) {
+            if(newMessages[i]) chats_indices[j++] = i; // fill array
+        }
+        int randomChatIndex = millis() % chatsWithNews; // pick a random chat
+
+        chat_index = randomChatIndex;
+
+        playLastMessages(chat_ids[chats_indices[randomChatIndex]], true); // play it back, transcode if necessary
+    }
+
+    // If no, fetch telegram servers
+    else {
+        if(processTelegramUpdates()) playNewMessage(); // fetch and if new messages, try again
+        else Serial.println("[MESSAGE] No new messages :(");
+    }
 }
 
-void playLastMessages(const char* chatId) {
+void playLastMessagesWrapper() {
+  playLastMessages(getChatId(), false);
+}
+
+// Play the last messages in a chat folder, transcode them if specified
+void playLastMessages(const char* chatId, bool transcodeOgg) {
     if (isRecording) return;
-    if (audio.isRunning()) audio.stopSong();
+    if (isAudioRunning) stopPlayback();
 
     char folderPath[24]; snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
 
     File dir = SD.open(folderPath);
-    if (!dir) return;
+    if (!dir) {
+        Serial.println("[ERROR] Directory was not found");
+        return;
+    };
 
     playbackQueue.clear(); // Clear any pending items in the queue
 
+    // Loop through files of specified chat folder
     while (File entry = dir.openNextFile()) {
         if (!entry.isDirectory()) {
-            const char* name = entry.name();
+            const char* name = entry.name(); // "received_123456789.ogg"; "recorded_342.wav"; "received_123456789.wav"
             
-            // ONLY play files that are transcoded received messages (ignore outgoing recordings)
-            if (strncmp(name, "received_", 9) == 0 && strstr(name, ".wav") != nullptr) {
-                char filePath[64];
+            // If file should be transcoded before playing
+            if (transcodeOgg && strstr(name, ".ogg") != nullptr) {
+                // Prepare file paths
+                char oggPath[MAX_PATH_LEN];
+                snprintf(oggPath, sizeof(oggPath), "%s/%s", folderPath, name);
+                char wavPath[MAX_PATH_LEN];
+                convertExtension_ogg2wav(oggPath, wavPath); // changes ".ogg" to ".wav"
+
+                // Queue transcode job
+                addTranscodeJob(oggPath, wavPath); // add job to the queue
+
+                // Add to playback queue but wait for transcoding to finish
+                playbackQueue.pushAndWaitFor(wavPath, chatId);
+            }
+            
+            // If file is a wav
+            else if (strstr(name, ".wav") != nullptr) {
+                char filePath[MAX_PATH_LEN]; 
                 snprintf(filePath, sizeof(filePath), "%s/%s", folderPath, name);
                 playbackQueue.push(filePath);
             }
@@ -233,10 +457,26 @@ void playLastMessages(const char* chatId) {
     }
 
     dir.close();
-    newMessages[findChatId(chatId)] = false;
+    newMessages[findChatId(chatId)] = false; // messages in this chat were all listened to
 }
 
-// Only ever keep all the last received OR all the last sent messages
+void convertExtension_ogg2wav(const char* oggStr, char* wavStr) {
+    if (!oggStr || !wavStr) return;
+
+    size_t destSize = sizeof(wavStr);
+
+    // Copy source to destination safely
+    strncpy(wavStr, oggStr, destSize - 1);
+    wavStr[destSize - 1] = '\0';
+
+    size_t len = strlen(wavStr);
+    if (len >= 4) {
+        // Just overwrite the end of the existing buffer
+        strcpy(wavStr + len - 4, ".wav");
+    }
+}
+
+// Only ever keep all the last received OR all the last recorded messages in the chat folder
 void cleanupChatFolder(const char* folderPath, const char* prefix) {
     File dir = SD.open(folderPath);
     if (!dir) return;
@@ -257,10 +497,12 @@ void cleanupChatFolder(const char* folderPath, const char* prefix) {
     dir.close();
 }
 
+// Get chatId by chatIndex
 const char* getChatId() {
     return chat_ids[chat_index];
 }
 
+// Get the chatIndex by chatId
 int findChatId(const char* chatId) {
   for(int i = 0; i < max_chats; i++) {
     if(strcmp(chatId, chat_ids[i]) == 0) return i;
@@ -268,233 +510,23 @@ int findChatId(const char* chatId) {
   return -1;
 }
 
-// ------------------------------
-// AUDIO TRANSCODING
-// ------------------------------
-bool transcodeOggToWav(const char* oggPath, const char* wavPath) {
-    Serial.println("[TRANSCODE] Starting OGG/Opus to WAV...");
-    
-    // Use the standard SD library classes
-    File inFile = SD.open(oggPath, FILE_READ);
-    File outFile = SD.open(wavPath, FILE_WRITE);
-    
-    if (!inFile || !outFile) {
-        if (inFile) inFile.close();
-        if (outFile) outFile.close();
-        Serial.println("[TRANSCODE] Failed to open files!");
-        return false;
-    }
-
-    // We use '::audio_tools' to force the compiler to look at the 
-    // root namespace and ignore the 'ambiguous' nested ones.
-
-    ::audio_tools::OpusOggDecoder opusDecoder;
-    ::audio_tools::WAVEncoder wavEncoder;
-    
-    // EncodedAudioStream needs to know the specific types to avoid 'incomplete type' errors
-    ::audio_tools::EncodedAudioStream inStream(&inFile, &opusDecoder);
-    ::audio_tools::EncodedAudioStream outStream(&outFile, &wavEncoder);
-    
-    ::audio_tools::StreamCopy copier(outStream, inStream);
-
-    // IMPORTANT: Opus usually requires a specific start. 
-    // We pass default settings to ensure 'begin' is fully realized.
-    auto opusSettings = opusDecoder.config();
-    inStream.begin(opusSettings); 
-    outStream.begin(); 
-
-    Serial.println("[TRANSCODE] Copying...");
-
-    // Perform the copy
-    while (copier.copy() > 0) {
-        yield(); 
-    }
-    
-    // Cleanup and Header Finalization
-    outStream.end();
-    inStream.end();
-    
-    inFile.close();
-    outFile.close();
-    
-    Serial.println("[TRANSCODE] Done!");
-    return true;
-}
-
-// ------------------------------
-// I2S & RECORDING
-// ------------------------------
-void setupI2S_record() {
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  i2s_new_channel(&chan_cfg, NULL, &rx_handle);
-
-  i2s_std_config_t std_cfg = {
-    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-    .gpio_cfg = {
-      .mclk = I2S_GPIO_UNUSED,
-      .bclk = (gpio_num_t)I2S_BCLK,
-      .ws = (gpio_num_t)I2S_LRC,
-      .dout = I2S_GPIO_UNUSED,
-      .din = (gpio_num_t)I2S_DIN,
-    }
-  };
-
-  i2s_channel_init_std_mode(rx_handle, &std_cfg);
-  i2s_channel_enable(rx_handle);
-}
-
-void stopI2S_record() {
-  if (rx_handle) {
-    i2s_channel_disable(rx_handle);
-    i2s_del_channel(rx_handle);
-    rx_handle = NULL;
-  }
-}
-
-void startRecording() {
-  if (isAudioRunning) stopPlayback();
-  const char* chatId = getChatId();
-  char folderPath[24]; snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
-  
-  if (!SD.exists(folderPath)) SD.mkdir(folderPath);
-
-  // Clear previously recorded messages so they don't pile up
-  cleanupChatFolder(folderPath, "recorded_");
-
-  snprintf(currentFilePath, sizeof(currentFilePath), "%s/recorded_%ld.wav", folderPath, random(1000)); 
-  audioFile = SD.open(currentFilePath, FILE_WRITE);
-
-  uint8_t header[44] = { 0 };
-  audioFile.write(header, 44);
-  bytesRecorded = 0;
-  isRecording = true;
-  setupI2S_record();
-
-  Serial.println("Aufnahme gestartet...");
-}
-
-void recordTask(void *pvParameters) {
-  while (true) {
-    if (isRecording) {
-      int16_t buffer[128];
-      size_t bytesRead = 0;
-      if(i2s_channel_read(rx_handle, buffer, sizeof(buffer), &bytesRead, 100) == ESP_OK) {
-        int16_t monoBuffer[64];
-        for(int i = 0; i < (bytesRead / 4); i++) {
-            monoBuffer[i] = buffer[i * 2];
+// Is this chatId within the contacts?
+bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
+    for (int i = 0; i < max_chats; i++)
+    {
+        if(strcmp(chat_id, chat_ids[i]) == 0) {
+            if(printIndex != nullptr) *printIndex = i;
+            return true;
         }
-        xQueueSend(audioQueue, monoBuffer, pdMS_TO_TICKS(10));
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(50)); 
-      }
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(50)); 
     }
-  }
+    return false;
 }
 
-void sdWriteTask(void *pvParameters) {
-  while (true) {
-    if(isRecording) {
-        int16_t buffer[64];
-        if (xQueueReceive(audioQueue, buffer, pdMS_TO_TICKS(100))) {
-            audioFile.write((uint8_t*)buffer, sizeof(buffer));
-            bytesRecorded += sizeof(buffer);
-        }
-    } else {
-        vTaskDelay(pdMS_TO_TICKS(50)); 
-    }
-  }
-}
 
-void finishRecording() {
-  isRecording = false;
-  stopI2S_record();
-  audioFile.seek(0);
-  writeWavHeader(audioFile, bytesRecorded);
-  audioFile.close();
-  setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
 
-  Serial.println("Aufnahme beendet. Senden wird vorbereitet...");
-  sendWavFile(currentFilePath, "message.wav", getChatId());
-}
 
-void writeWavHeader(File file, uint32_t fileSize) {
-  uint32_t sampleRate = SAMPLE_RATE;
-  uint16_t numChannels = 1;
-  uint16_t bitsPerSample = 16;
-  uint32_t byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-  file.write((const uint8_t*)"RIFF", 4);
-  uint32_t chunkSize = fileSize + 36;
-  file.write((const uint8_t*)&chunkSize, 4);
-  file.write((const uint8_t*)"WAVE", 4);
-  file.write((const uint8_t*)"fmt ", 4);
-  uint32_t subchunk1Size = 16;
-  file.write((const uint8_t*)&subchunk1Size, 4);
-  uint16_t audioFormat = 1;
-  file.write((const uint8_t*)&audioFormat, 2);
-  file.write((const uint8_t*)&numChannels, 2);
-  file.write((const uint8_t*)&sampleRate, 4);
-  file.write((const uint8_t*)&byteRate, 4);
-  uint16_t blockAlign = numChannels * (bitsPerSample / 8);
-  file.write((const uint8_t*)&blockAlign, 2);
-  file.write((const uint8_t*)&bitsPerSample, 2);
-  file.write((const uint8_t*)"data", 4);
-  file.write((const uint8_t*)&fileSize, 4);
-}
 
-// ------------------------------
-// TELEGRAM COMMS
-// ------------------------------
-void sendWavFile(const char* filePath, const char* fileName, const char* chat_id) {
-  File f = SD.open(filePath);
-  if (!f) {
-    Serial.println("[ERROR] Could not open file for upload");
-    return;
-  }
-
-  size_t fileSize = f.size();
-  WiFiClientSecure client_upload;
-  client_upload.setInsecure();
-
-  if (!client_upload.connect("api.telegram.org", 443)) {
-    Serial.println("[ERROR] Connection to Telegram failed");
-    f.close();
-    return;
-  }
-
-  String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
-  String partHeader = "--" + boundary + "\r\n"
-                      "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
-                      + chat_id + "\r\n"
-                      "--" + boundary + "\r\n"
-                      "Content-Disposition: form-data; name=\"document\"; filename=\""
-                      + fileName + "\"\r\n"
-                      "Content-Type: audio/wav\r\n\r\n";
-  String partFooter = "\r\n--" + boundary + "--\r\n";
-  size_t totalLength = partHeader.length() + fileSize + partFooter.length();
-
-  client_upload.println("POST /bot" + String(BOT_TOKEN) + "/sendDocument HTTP/1.1");
-  client_upload.println("Host: api.telegram.org");
-  client_upload.println("Content-Type: multipart/form-data; boundary=" + boundary);
-  client_upload.println("Content-Length: " + String(totalLength));
-  client_upload.println("Connection: close");
-  client_upload.println();
-  client_upload.print(partHeader);
-
-  uint8_t buf[512];
-  while (f.available()) {
-    size_t n = f.read(buf, sizeof(buf));
-    client_upload.write(buf, n);
-  }
-  f.close();
-
-  client_upload.print(partFooter);
-
-  client_upload.stop();
-  Serial.println("Senden beendet.");
-}
+// TELEGRAM COMMS ================================
 
 // RECEIVING 
 
@@ -518,6 +550,8 @@ bool processTelegramUpdates() {
         if(!error) {
             JsonArray results = doc_updates["result"].as<JsonArray>();
             
+
+            // For every new message
             for (JsonObject currentResult : results) {
 
                 lastUpdateId = currentResult["update_id"] | 0;
@@ -527,65 +561,57 @@ bool processTelegramUpdates() {
                     continue;
                 }
                 
-                Serial.print("\nNEW MESSAGE (Update ID: ");
-                Serial.print(lastUpdateId); Serial.println(")");
+                Serial.printf("\nNEW MESSAGE (Update ID: %ld\n)", lastUpdateId);
                 
                 JsonObject message = currentResult["message"];
                 const char* fromName = message["from"]["first_name"] | "Unknown";
                 long long chatId = message["chat"]["id"].as<long long>() | 0;
                 
-                Serial.print("From: "); Serial.print(fromName);
-                Serial.print("      Chat ID: "); Serial.println(chatId);
+                Serial.printf("From: %s     Chat ID: %lld\n", fromName, chatId);
 
                 char chatId_str[14]; snprintf(chatId_str, sizeof(chatId_str), "%lld", chatId);
 
-            int chatIndex = -1;
-                if(!isValidChat(chatId_str, &chatIndex)) {
+                int chatIndex = -1; // gets filled in by isValidChat()
+                if (!isValidChat(chatId_str, &chatIndex)) {
                     Serial.println("[ERROR] chat id is unknown");
                     continue;
-                } 
+                }
 
-            if (message.containsKey("voice")) {
+                // Voice Message?
+                if (message.containsKey("voice")) {
                     Serial.println("Type: VoiceMessage");
-                const char* fileId = message["voice"]["file_id"];
+
+                    const char* fileId = message["voice"]["file_id"];
 
                     // Create directory if needed
                     char folderPath[32]; snprintf(folderPath, sizeof(folderPath), "/%lld", chatId); 
-                if(!SD.exists(folderPath)) SD.mkdir(folderPath);
+                    if(!SD.exists(folderPath)) SD.mkdir(folderPath);
 
-                    // Remove all previously received messages (keeps SD clean)
-                cleanupChatFolder(folderPath, "received_");
+                    // Clear all previously recorded messages
+                    cleanupChatFolder(folderPath, "recorded_");
 
-                    // Download raw Opus/OGG first
+                    // Set up target OGG file path
                     char oggFilePath[64];
                     snprintf(oggFilePath, sizeof(oggFilePath), "%s/received_%ld.ogg", folderPath, lastUpdateId);
 
+                    // Download Opus/OGG file
                     if (downloadTelegramFile(fileId, oggFilePath)) {
-                        
-                        // Set up target WAV file path
-                        char wavFilePath[64];
-                        snprintf(wavFilePath, sizeof(wavFilePath), "%s/received_%ld.wav", folderPath, lastUpdateId);
-
-                        // Run Offline Transcode
-                        if (transcodeOggToWav(oggFilePath, wavFilePath)) {
-                            SD.remove(oggFilePath); // Delete original compressed file
-                        newMessages[chatIndex] = true;
-                        ret = true;
-                        } else {
-                            Serial.println("[ERROR] Voice message decoding failed. Corrupt file?");
-                            SD.remove(oggFilePath);
-                            SD.remove(wavFilePath);
+                        newMessages[chatIndex] = true; // signalize this chat has new, unlistened messages (in ogg format)
+                    }
                 }
-            } 
-        }
+
+                // Text Message?
                 else if (message.containsKey("text")) {
                     const char* text = message["text"];
                     Serial.print("Type: Text -> Content: ");
                     Serial.println(text);
                 }
+
+                // Other Message?
                 else {
                     Serial.println("Type: OTHER");
                 }
+
                 Serial.println("----------------------------\n");
             }
         } else {
@@ -645,126 +671,330 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
     return false;
 }
 
-// ------------------------------
-// MAIN PLAYBACK ENGINE
-// ------------------------------
+
+// SENDING
+
+void sendWavFile(const char* filePath, const char* fileName, const char* chat_id) {
+  File f = SD.open(filePath);
+  if (!f) {
+    Serial.println("[ERROR] Could not open file for upload");
+    return;
+  }
+
+  size_t fileSize = f.size();
+  WiFiClientSecure client_upload;
+  client_upload.setInsecure();
+
+  if (!client_upload.connect("api.telegram.org", 443)) {
+    Serial.println("[ERROR] Connection to Telegram failed");
+    f.close();
+    return;
+  }
+
+  String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+  String partHeader = "--" + boundary + "\r\n"
+                      "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+                      + chat_id + "\r\n"
+                      "--" + boundary + "\r\n"
+                      "Content-Disposition: form-data; name=\"document\"; filename=\""
+                      + fileName + "\"\r\n"
+                      "Content-Type: audio/wav\r\n\r\n";
+  String partFooter = "\r\n--" + boundary + "--\r\n";
+  size_t totalLength = partHeader.length() + fileSize + partFooter.length();
+
+  client_upload.println("POST /bot" + String(BOT_TOKEN) + "/sendDocument HTTP/1.1");
+  client_upload.println("Host: api.telegram.org");
+  client_upload.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client_upload.println("Content-Length: " + String(totalLength));
+  client_upload.println("Connection: close");
+  client_upload.println();
+  client_upload.print(partHeader);
+
+  uint8_t buf[512];
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    client_upload.write(buf, n);
+  }
+  f.close();
+
+  client_upload.print(partFooter);
+
+  client_upload.stop();
+  Serial.println("Senden beendet.");
+}
+
+
+
+
+
+// AUDIO PLAYBACK ==============================================
+
 void startPlayback(const char* filePath) {
     if (isAudioRunning) stopPlayback(); 
+    
     audioFile = SD.open(filePath);
-    if (!audioFile) return;
-    decoderStream.begin(); 
+    if (!audioFile) {
+        Serial.print("Error: Could not open ");
+        Serial.println(filePath);
+        return;
+    }
+
+    // Prepare output stream for new file (resets decoder state)
+    out_stream.begin();
+    
+    // Point copier to newly opened file and output stream
+    copier_playback.begin(out_stream, audioFile);
+    
     isAudioRunning = true;
 }
 
 void stopPlayback() {
     if (isAudioRunning) {
         isAudioRunning = false;
+        out_stream.end(); // Stop the decoder and stream cleanly
+        
         if (audioFile) audioFile.close();
-        decoderStream.flush(); 
     }
 }
 
 void processAudio() {
     if (!isAudioRunning) return;
+    
+    // Is file still open and has data left?
     if (audioFile && audioFile.available()) {
-        uint8_t buffer[512];
-        size_t bytesRead = audioFile.read(buffer, sizeof(buffer));
-        if (bytesRead > 0) decoderStream.write(buffer, bytesRead);
+        copier_playback.copy(); // Copy next chunk of audio
     } else {
-        audioFile.close();
-        isAudioRunning = false;
+        stopPlayback(); 
     }
 }
-
-// ------------------------------
-// SETUP & LOOP
-// ------------------------------
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-
-    pinMode(BUTTON, INPUT_PULLUP);
-    pinMode(BUTTON_DIAL, INPUT_PULLUP);
-    
-    Serial.println("\n[SYSTEM] Initializing...");
-    
-    if (!SD.begin(SD_CS)) {
-        Serial.println("[CRITICAL] SD Card Mount Failed!");
-        while (1);
-    }
-    Serial.println("[OK] SD Card Initialized.");
-
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("[SYSTEM] Connecting to WiFi");
-    
-    unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
-        delay(500);
-        Serial.print(".");
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
-    } else {
-        Serial.println("\n[OK] WiFi connected.");
-        
-        Serial.println("[SYSTEM] Syncing time...");
-        configTime(0, 0, "pool.ntp.org", "time.google.com");
-        
-        time_t now = time(nullptr);
-        int retry = 0;
-        while (now < 24 * 3600 && retry < 100) { 
-            delay(100); 
-            now = time(nullptr);
-            retry++;
-        }
-        
-        if (now < 24 * 3600) {
-            Serial.println("[WARNING] Time sync failed. SSL certificates might fail.");
-        } else {
-            Serial.println("[OK] Time synced.");
-        }
-    }
-
-    client_wifi.setInsecure(); 
-    setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-
-    audioQueue = xQueueCreate(20, 64 * sizeof(int16_t));
-    xTaskCreate(recordTask, "Capture", 4096, NULL, 5, NULL);
-    xTaskCreate(sdWriteTask, "Writer", 4096, NULL, 3, NULL);
-
-    Serial.println("[SYSTEM] Ready. Waiting for Telegram messages...");
-}
-
-void loop() {
-    processAudio();
-    handleButton(button, "button");
-    handleButton(button_dial, "dial");
-
-    if(!isAudioRunning && playbackQueue.count > 0) {
-        static char filePlaying[MAX_PATH_LEN];
-        playbackQueue.pop(filePlaying);
-        startPlayback(filePlaying);
-    }
-}
-
-// UTILITY
 
 void setI2SPinout(int bclk, int lrck, int din) {
-    auto config = i2sOut.defaultConfig(TX_MODE);
+    auto config = i2s.defaultConfig(TX_MODE);
     config.pin_bck = bclk;
     config.pin_ws = lrck;
     config.pin_data = din;
-    i2sOut.begin(config);
+    i2s.begin(config);
 }
 
-bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
-    for (int i = 0; i < max_chats; i++)
-    {
-        if(strcmp(chat_id, chat_ids[i]) == 0) {
-            if(printIndex != nullptr) *printIndex = i;
-            return true;
+
+
+
+
+// AUDIO RECORDING ======================================
+
+// Set things up for record task
+void startRecording() {
+    if (isAudioRunning) stopPlayback();
+
+    const char *chatId = getChatId();
+    char folderPath[24];
+    snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
+
+    if (!SD.exists(folderPath))
+        SD.mkdir(folderPath);
+
+    // Clear previously received messages
+    cleanupChatFolder(folderPath, "received_");
+
+    snprintf(currentFilePath, sizeof(currentFilePath), "%s/recorded_%ld.wav", folderPath, random(1000));
+    audioFile = SD.open(currentFilePath, FILE_WRITE);
+
+    uint8_t header[44] = {0};
+    audioFile.write(header, 44);
+    bytesRecorded = 0;
+    isRecording = true;
+    setupI2S_record();
+
+    Serial.println("Aufnahme gestartet...");
+}
+
+// FreeRTOS task to do the actual recording
+void recordTask(void *pvParameters) {
+  while (true) {
+    if (isRecording) {
+      int16_t buffer[128];
+      size_t bytesRead = 0;
+      if(i2s_channel_read(rx_handle, buffer, sizeof(buffer), &bytesRead, 100) == ESP_OK) {
+        int16_t monoBuffer[64];
+        for(int i = 0; i < (bytesRead / 4); i++) {
+            monoBuffer[i] = buffer[i * 2];
+        }
+        xQueueSend(audioQueue, monoBuffer, pdMS_TO_TICKS(10));
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(50)); 
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(50)); 
+    }
+  }
+}
+
+// FreeRTOS task to store recorded bytes on sd card
+void sdWriteTask(void *pvParameters) {
+  while (true) {
+    if(isRecording) {
+        int16_t buffer[64];
+        if (xQueueReceive(audioQueue, buffer, pdMS_TO_TICKS(100))) {
+            audioFile.write((uint8_t*)buffer, sizeof(buffer));
+            bytesRecorded += sizeof(buffer);
+        }
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(50)); 
+    }
+  }
+}
+
+// Tie things up after recording is done
+void finishRecording() {
+  isRecording = false;
+  stopI2S_record();
+  audioFile.seek(0);
+  writeWavHeader(audioFile, bytesRecorded);
+  audioFile.close();
+  //setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+
+  Serial.println("Aufnahme beendet. Senden wird vorbereitet...");
+  sendWavFile(currentFilePath, "message.wav", getChatId());
+}
+
+void setupI2S_record() {
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  i2s_new_channel(&chan_cfg, NULL, &rx_handle);
+
+  i2s_std_config_t std_cfg = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)I2S_BCLK,
+      .ws = (gpio_num_t)I2S_LRC,
+      .dout = I2S_GPIO_UNUSED,
+      .din = (gpio_num_t)I2S_DIN,
+    }
+  };
+
+  i2s_channel_init_std_mode(rx_handle, &std_cfg);
+  i2s_channel_enable(rx_handle);
+}
+
+void stopI2S_record() {
+  if (rx_handle) {
+    i2s_channel_disable(rx_handle);
+    i2s_del_channel(rx_handle);
+    rx_handle = NULL;
+  }
+}
+
+void writeWavHeader(File file, uint32_t fileSize) {
+  uint32_t sampleRate = SAMPLE_RATE;
+  uint16_t numChannels = 1;
+  uint16_t bitsPerSample = 16;
+  uint32_t byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  file.write((const uint8_t*)"RIFF", 4);
+  uint32_t chunkSize = fileSize + 36;
+  file.write((const uint8_t*)&chunkSize, 4);
+  file.write((const uint8_t*)"WAVE", 4);
+  file.write((const uint8_t*)"fmt ", 4);
+  uint32_t subchunk1Size = 16;
+  file.write((const uint8_t*)&subchunk1Size, 4);
+  uint16_t audioFormat = 1;
+  file.write((const uint8_t*)&audioFormat, 2);
+  file.write((const uint8_t*)&numChannels, 2);
+  file.write((const uint8_t*)&sampleRate, 4);
+  file.write((const uint8_t*)&byteRate, 4);
+  uint16_t blockAlign = numChannels * (bitsPerSample / 8);
+  file.write((const uint8_t*)&blockAlign, 2);
+  file.write((const uint8_t*)&bitsPerSample, 2);
+  file.write((const uint8_t*)"data", 4);
+  file.write((const uint8_t*)&fileSize, 4);
+}
+
+
+
+
+
+// AUDIO TRANSCODING ==========================================
+
+void addTranscodeJob(const char* oggFile, const char* wavFile) {
+    TranscodeJob newJob;
+    strncpy(newJob.inFile, oggFile, sizeof(newJob.inFile));
+    strncpy(newJob.outFile, wavFile, sizeof(newJob.outFile));
+    xQueueSend(jobQueue, &newJob, portMAX_DELAY);
+}
+
+// Transcode OGG/Opus file into Wav File
+void transcodeTask(void *pvParameters) {
+    Serial.println("Transcoder task initialized. Sleeping until a job arrives...");
+
+    TranscodeJob job;
+    
+    while (true) {
+        // Block indefinitely until a job is pushed to the queue.
+        if (xQueueReceive(jobQueue, &job, portMAX_DELAY) == pdPASS) {
+            Serial.printf("\n[Transcoder] Started: %s -> %s\n", job.inFile, job.outFile);
+
+            audioFileIn = SD.open(job.inFile, FILE_READ);
+            audioFileOut = SD.open(job.outFile, FILE_WRITE);
+
+            if (!audioFileIn || !audioFileOut) {
+                Serial.println("[Transcoder] Error: Failed to open files.");
+                if (audioFileIn) audioFileIn.close();
+                if (audioFileOut) audioFileOut.close();
+                continue; // Skip this job and wait for the next one
+            }
+
+            // Set up audio information
+            AudioInfo info(48000, 1, 16);
+            decoder_opusOgg.addNotifyAudioChange(encoder_wav); // Decoder notifies the encoder in case ogg file has different audio info
+
+            // Ensure PSRAM is initialized and available
+            if (psramInit()) {
+                Serial.printf("PSRAM initialized! Total PSRAM: %d bytes\n", ESP.getPsramSize());
+                Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
+            } else {
+                Serial.println("ERROR: PSRAM failed to initialize. Transcoding likely won't work.");
+                // You might want to halt execution here if PSRAM is strictly required
+            }
+
+            dec_stream.resizeReadResultQueue(131072); // Large enough to hold raw PCM bytes worth of one page of decoded ogg/opus bytes
+
+            dec_stream.begin(info);
+            enc_stream.begin(info);
+
+            int flushCounter = 0;
+
+            // Main Transcoding Loop
+            while (true) {
+                size_t bytesCopied = copier_transcode.copy();
+
+                Serial.println(bytesCopied);
+
+                // Handle the start-up delay and end-of-file buffer flushing
+                if (bytesCopied == 0) {
+                    // Check if the input file has data left.
+                    // Yes? Do nothing. Decoder is likely parsing headers or spinning up.
+                    if (audioFileIn.available() == 0) {
+                        // No? File is read. Tick a counter to let the copier_transcode flush trapped PCM data.
+                        flushCounter++;
+                        if (flushCounter > 10) break;
+                    }
+                } 
+                else flushCounter = 0; // Reset counter if all data was moved
+
+                // Yield to FreeRTOS watchdog
+                vTaskDelay(pdMS_TO_TICKS(2)); 
+            }
+
+            // Cleanup memory and close files for this job
+            enc_stream.end();
+            dec_stream.end();
+            audioFileIn.close();
+            audioFileOut.close();
+
+            // Tell playback queue transcoding is finished
+            playbackQueue.signalizeFileReady(job.outFile);
+
+            Serial.println("[Transcoder] Complete. Back to sleep.");
         }
     }
-    return false;
 }
