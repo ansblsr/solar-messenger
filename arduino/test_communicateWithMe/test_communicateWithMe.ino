@@ -75,7 +75,7 @@ Button button_dial = {BUTTON_DIAL, HIGH, 0, false, false, dialUp, playLastMessag
 
 // PLAYBACK ==============================
 
-#define QUEUE_SIZE 5 // maximum expected number of files
+#define QUEUE_SIZE 20 // maximum expected number of files
 #define MAX_PATH_LEN 64 // maximum path length
 
 struct PlaybackQueue {
@@ -423,37 +423,59 @@ void playLastMessages(const char* chatId, bool transcodeOgg) {
 
     playbackQueue.clear(); // Clear any pending items in the queue
 
+    // We will collect file names, sort them to guarantee correct chronological playback
+    char fileNames[QUEUE_SIZE][MAX_PATH_LEN];
+    int fileCount = 0;
+
     // Loop through files of specified chat folder
     while (File entry = dir.openNextFile()) {
-        if (!entry.isDirectory()) {
-            const char* name = entry.name(); // "received_123456789.ogg"; "recorded_342.wav"; "received_123456789.wav"
-            
-            // If file should be transcoded before playing
-            if (transcodeOgg && strstr(name, ".ogg") != nullptr) {
-                // Prepare file paths
-                char oggPath[MAX_PATH_LEN];
-                snprintf(oggPath, sizeof(oggPath), "%s/%s", folderPath, name);
-                char wavPath[MAX_PATH_LEN];
-                convertExtension_ogg2wav(oggPath, wavPath); // changes ".ogg" to ".wav"
-
-                // Queue transcode job
-                addTranscodeJob(oggPath, wavPath); // add job to the queue
-
-                // Add to playback queue but wait for transcoding to finish
-                playbackQueue.pushAndWaitFor(wavPath, chatId);
-            }
-            
-            // If file is a wav
-            else if (strstr(name, ".wav") != nullptr) {
-                char filePath[MAX_PATH_LEN]; 
-                snprintf(filePath, sizeof(filePath), "%s/%s", folderPath, name);
-                playbackQueue.push(filePath);
-            }
+        if (!entry.isDirectory() && fileCount < QUEUE_SIZE) {
+            strncpy(fileNames[fileCount], entry.name(), MAX_PATH_LEN);
+            fileCount++;
         }
         entry.close();
     }
-
     dir.close();
+
+    // Sort files alphabetically so "received_000", "received_001" are processed in order
+    for (int i = 0; i < fileCount - 1; i++) {
+        for (int j = i + 1; j < fileCount; j++) {
+            if (strcmp(fileNames[i], fileNames[j]) > 0) {
+                char temp[MAX_PATH_LEN];
+                strncpy(temp, fileNames[i], MAX_PATH_LEN);
+                strncpy(fileNames[i], fileNames[j], MAX_PATH_LEN);
+                strncpy(fileNames[j], temp, MAX_PATH_LEN);
+            }
+        }
+    }
+
+    // Loop through files of specified chat folder
+    for (int i = 0; i < fileCount; i++) {
+        const char* name = fileNames[i];  // "received_000.ogg"; "recorded_001.wav"
+
+        // If file should be transcoded before playing
+        if (transcodeOgg && strstr(name, ".ogg") != nullptr) {
+            // Prepare file paths
+            char oggPath[MAX_PATH_LEN];
+            snprintf(oggPath, sizeof(oggPath), "%s/%s", folderPath, name);
+            char wavPath[MAX_PATH_LEN];
+            convertExtension_ogg2wav(oggPath, wavPath);  // changes ".ogg" to ".wav"
+
+            // Queue transcode job
+            addTranscodeJob(oggPath, wavPath);  // add job to the queue
+
+            // Add to playback queue but wait for transcoding to finish
+            playbackQueue.pushAndWaitFor(wavPath, chatId);
+        }
+
+        // If file is a wav
+        else if (strstr(name, ".wav") != nullptr) {
+            char filePath[MAX_PATH_LEN];
+            snprintf(filePath, sizeof(filePath), "%s/%s", folderPath, name);
+            playbackQueue.push(filePath);
+        }
+    }
+
     newMessages[findChatId(chatId)] = false; // messages in this chat were all listened to
 }
 
@@ -468,6 +490,28 @@ void convertExtension_ogg2wav(const char* oggStr, char* wavStr) {
         // Just overwrite the end of the existing buffer
         strcpy(wavStr + len - 4, ".wav");
     }
+}
+
+// Scans a folder to find the next available sequential number for a specific prefix
+int getNextFileIndex(const char* folderPath, const char* prefix) {
+    File dir = SD.open(folderPath);
+    if (!dir) return 0;
+    
+    int maxIndex = -1;
+    while (File entry = dir.openNextFile()) {
+        if (!entry.isDirectory()) {
+            const char* name = entry.name();
+            // Check if the filename starts with the required prefix
+            if (strncmp(name, prefix, strlen(prefix)) == 0) {
+                // Extract number after the prefix
+                int idx = atoi(name + strlen(prefix));
+                if (idx > maxIndex) maxIndex = idx;
+            }
+        }
+        entry.close();
+    }
+    dir.close();
+    return maxIndex + 1; // Return the next number
 }
 
 // Only ever keep all the last received OR all the last recorded messages in the chat folder
@@ -584,9 +628,10 @@ bool processTelegramUpdates() {
                     // Clear all previously recorded messages
                     cleanupChatFolder(folderPath, "recorded_");
 
-                    // Set up target OGG file path
+                    // Set up target OGG file path with incremented numbering
+                    int fileIndex = getNextFileIndex(folderPath, "received_");
                     char oggFilePath[64];
-                    snprintf(oggFilePath, sizeof(oggFilePath), "%s/received_%ld.ogg", folderPath, lastUpdateId);
+                    snprintf(oggFilePath, sizeof(oggFilePath), "%s/received_%03d.ogg", folderPath, fileIndex);
 
                     // Download Opus/OGG file
                     if (downloadTelegramFile(fileId, oggFilePath)) {
@@ -740,7 +785,7 @@ void startPlayback(const char* filePath) {
     
     isAudioRunning = true;
 
-    Serial.println("Playback started.");
+    Serial.print("Playback started...");
 }
 
 void stopPlayback() {
@@ -750,7 +795,7 @@ void stopPlayback() {
         
         if (audioFile) audioFile.close();
 
-        Serial.println("Playback stopped.");
+        Serial.println(" --> Done.");
     }
 }
 
@@ -793,7 +838,9 @@ void startRecording() {
     // Clear previously received messages
     cleanupChatFolder(folderPath, "received_");
 
-    snprintf(currentFilePath, sizeof(currentFilePath), "%s/recorded_%ld.wav", folderPath, random(1000));
+    // Create wav filepath with increased index
+    int fileIndex = getNextFileIndex(folderPath, "recorded_");
+    snprintf(currentFilePath, sizeof(currentFilePath), "%s/recorded_%03d.wav", folderPath, fileIndex);
     audioFile = SD.open(currentFilePath, FILE_WRITE);
 
     uint8_t header[44] = {0};
