@@ -14,11 +14,6 @@
 
 // ========================================================================================
 
-
-// Buttons
-const unsigned long SHORT_PRESS_TIME = 500; // Threshold for long press
-
-
 // Forward Declarations
 void playNewMessage();
 void startRecording();
@@ -58,6 +53,8 @@ int findChatId(const char* chatId);
 
 #define BUTTON A5
 #define BUTTON_DIAL A4
+
+const unsigned long SHORT_PRESS_TIME = 500; // Threshold for long press
 
 using ButtonEvent = void (*)();
 
@@ -122,7 +119,7 @@ struct PlaybackQueue {
     }
 
     bool pushAndWaitFor(const char* path, const char* chatId) {
-        if(waitCount > 0 && strcmp(waitingOnChatId, chatId) != 0) return false;
+        if(waitCount > 0 && strcmp(waitingOnChatId, chatId) != 0) return false; // If already waiting and this chatId isn't already waited for
 
         if(push(path)) {
             snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", chatId);
@@ -133,8 +130,8 @@ struct PlaybackQueue {
     }
 
     void signalizeFileReady(const char* wavPath) {
-        if (strstr(wavPath, waitingOnChatId) != nullptr) waitCount--;
-        if (waitCount == 0) snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", "");
+        if (strstr(wavPath, waitingOnChatId) != nullptr) waitCount--; // If we waited for this chat
+        if (waitCount == 0) snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", ""); // If everything is here, forget chatId
     }
 };
 
@@ -215,7 +212,7 @@ void setup() {
     pinMode(BUTTON, INPUT_PULLUP);
     pinMode(BUTTON_DIAL, INPUT_PULLUP);
 
-    AudioLogger::instance().begin(Serial, AudioLogger::Debug);
+    //AudioLogger::instance().begin(Serial, AudioLogger::Debug);
     
     Serial.println("\n[SYSTEM] Initializing...");
     
@@ -408,7 +405,7 @@ void playNewMessage() {
 }
 
 void playLastMessagesWrapper() {
-  playLastMessages(getChatId(), false);
+  playLastMessages(getChatId(), true);
 }
 
 // Play the last messages in a chat folder, transcode them if specified
@@ -463,11 +460,8 @@ void playLastMessages(const char* chatId, bool transcodeOgg) {
 void convertExtension_ogg2wav(const char* oggStr, char* wavStr) {
     if (!oggStr || !wavStr) return;
 
-    size_t destSize = sizeof(wavStr);
-
     // Copy source to destination safely
-    strncpy(wavStr, oggStr, destSize - 1);
-    wavStr[destSize - 1] = '\0';
+    strcpy(wavStr, oggStr);
 
     size_t len = strlen(wavStr);
     if (len >= 4) {
@@ -597,6 +591,7 @@ bool processTelegramUpdates() {
                     // Download Opus/OGG file
                     if (downloadTelegramFile(fileId, oggFilePath)) {
                         newMessages[chatIndex] = true; // signalize this chat has new, unlistened messages (in ogg format)
+                        ret = true;
                     }
                 }
 
@@ -611,8 +606,6 @@ bool processTelegramUpdates() {
                 else {
                     Serial.println("Type: OTHER");
                 }
-
-                Serial.println("----------------------------\n");
             }
         } else {
             Serial.print("[ERROR] Parsing failed: "); Serial.println(error.c_str());
@@ -730,7 +723,7 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
 // AUDIO PLAYBACK ==============================================
 
 void startPlayback(const char* filePath) {
-    if (isAudioRunning) stopPlayback(); 
+    if (isAudioRunning) stopPlayback();
     
     audioFile = SD.open(filePath);
     if (!audioFile) {
@@ -746,6 +739,8 @@ void startPlayback(const char* filePath) {
     copier_playback.begin(out_stream, audioFile);
     
     isAudioRunning = true;
+
+    Serial.println("Playback started.");
 }
 
 void stopPlayback() {
@@ -754,6 +749,8 @@ void stopPlayback() {
         out_stream.end(); // Stop the decoder and stream cleanly
         
         if (audioFile) audioFile.close();
+
+        Serial.println("Playback stopped.");
     }
 }
 
@@ -948,12 +945,9 @@ void transcodeTask(void *pvParameters) {
             decoder_opusOgg.addNotifyAudioChange(encoder_wav); // Decoder notifies the encoder in case ogg file has different audio info
 
             // Ensure PSRAM is initialized and available
-            if (psramInit()) {
-                Serial.printf("PSRAM initialized! Total PSRAM: %d bytes\n", ESP.getPsramSize());
-                Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
-            } else {
-                Serial.println("ERROR: PSRAM failed to initialize. Transcoding likely won't work.");
-                // You might want to halt execution here if PSRAM is strictly required
+            if (!psramInit()) {
+                Serial.println("ERROR: PSRAM failed to initialize. Aborting transcoding.");
+                continue;
             }
 
             dec_stream.resizeReadResultQueue(131072); // Large enough to hold raw PCM bytes worth of one page of decoded ogg/opus bytes
@@ -967,7 +961,7 @@ void transcodeTask(void *pvParameters) {
             while (true) {
                 size_t bytesCopied = copier_transcode.copy();
 
-                Serial.println(bytesCopied);
+                Serial.print(".");
 
                 // Handle the start-up delay and end-of-file buffer flushing
                 if (bytesCopied == 0) {
@@ -991,10 +985,13 @@ void transcodeTask(void *pvParameters) {
             audioFileIn.close();
             audioFileOut.close();
 
+            // Remove transcoded ogg file from card
+            SD.remove(job.inFile);
+
             // Tell playback queue transcoding is finished
             playbackQueue.signalizeFileReady(job.outFile);
 
-            Serial.println("[Transcoder] Complete. Back to sleep.");
+            Serial.println("\n[Transcoder] Transcoding finished. Back to sleep.");
         }
     }
 }
