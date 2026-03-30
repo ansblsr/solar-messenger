@@ -26,7 +26,6 @@ bool isValidChat(const char* chat_id, int* printIndex = nullptr);
 bool downloadTelegramFile(const char* fileId, const char* destination);
 bool transcodeOggToWav(const char* oggPath, const char* wavPath);
 void cleanupChatFolder(const char* folderPath, const char* prefix);
-void writeWavHeader(File file, uint32_t fileSize);
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id);
 bool processTelegramUpdates();
 void startPlayback(const char* filePath);
@@ -146,20 +145,40 @@ bool newMessages[max_chats] = {false};
 bool isAudioRunning = false;
 File audioFile;
 
-I2SStream i2s;
+I2SStream i2s_playback;
 WAVDecoder decoder_wav;
-EncodedAudioStream out_stream(&i2s, &decoder_wav); // data written to 'out_stream' gets decoded as WAV and sent to I2S.
-StreamCopy copier_playback(out_stream, audioFile); // pulls bytes from sd-file and pushes them to out_stream
+EncodedAudioStream stream_wavToI2s(&i2s_playback, &decoder_wav); // data written to 'stream_wavToI2s' gets decoded and sent to I2S.
+StreamCopy copier_playback(stream_wavToI2s, audioFile); // pulls bytes from sd-file and pushes them to stream_wavToI2s
 
 
 // RECORDING =========================
+// Mic → I2SStream → AudioStream → WAVEncoder → File
+
+I2SStream i2s_record;
+
+WAVEncoder encoderWav_record;
+AudioInfo info_WavEncoder(16000, 1, 16); // [sample-rate, num_channels, bits per sample]
+
+File audioFile_record;
+EncodedAudioStream stream_wavToFile(&audioFile_record, &encoderWav_record);
+AudioInfo info_recording(16000, 2, 16); // for the I2S Stream [sample-rate, num_channels, bits per sample]
 
 volatile bool isRecording = false;
-
-QueueHandle_t audioQueue;
+bool wasRecording = false;
 char currentFilePath[64]; // where the file is stored, that is being recorded
-uint32_t bytesRecorded = 0;
 
+// Memory pool for passing data without dynamic allocation overhead
+#define NUM_CHUNKS 20
+#define CHUNK_SIZE 1024
+
+struct AudioBuffer {
+    uint8_t data[CHUNK_SIZE];
+    size_t size;
+};
+
+AudioBuffer buffers[NUM_CHUNKS];
+QueueHandle_t emptyQueue;
+QueueHandle_t fullQueue;
 
 
 // TRANSCODING ============================
@@ -182,10 +201,10 @@ File audioFileOut;
 OpusOggDecoder decoder_opusOgg;
 WAVEncoder encoder_wav;
 
-EncodedAudioStream dec_stream(&audioFileIn, &decoder_opusOgg);
-EncodedAudioStream enc_stream(&audioFileOut, &encoder_wav);
+EncodedAudioStream stream_OggToFileIn(&audioFileIn, &decoder_opusOgg);
+EncodedAudioStream stream_WavToFileOut(&audioFileOut, &encoder_wav);
 
-StreamCopy copier_transcode(enc_stream, dec_stream, 16384);
+StreamCopy copier_transcode(stream_WavToFileOut, stream_OggToFileIn, 16384);
 
 
 // NETWORKING =========================
@@ -206,18 +225,18 @@ i2s_chan_handle_t rx_handle = NULL;
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
+    while (!Serial);
 
     // Pins
     pinMode(BUTTON, INPUT_PULLUP);
     pinMode(BUTTON_DIAL, INPUT_PULLUP);
 
-    //AudioLogger::instance().begin(Serial, AudioLogger::Debug);
+    AudioLogger::instance().begin(Serial, AudioLogger::Debug);
     
     Serial.println("\n[SYSTEM] Initializing...");
     
 
-    // SD card mount
+    // SD card mount -----------------------------
     if (!SD.begin(SD_CS)) {
         Serial.println("[CRITICAL] SD Card Mount Failed!");
         while (1);
@@ -225,64 +244,38 @@ void setup() {
     Serial.println("[OK] SD Card Initialized.");
 
 
-    // WiFi connection
+    if (!connectWiFi()) while(1);
 
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("[SYSTEM] Connecting to WiFi");
+    setI2SData_playback();
+
+
+    // Audio Recording -----------------------
+
+    emptyQueue = xQueueCreate(NUM_CHUNKS, sizeof(AudioBuffer*));
+    fullQueue = xQueueCreate(NUM_CHUNKS, sizeof(AudioBuffer*));
     
-    unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
-        delay(500);
-        Serial.print(".");
+    // Fill up emptyQueue with (yet undefined) buffers
+    for (int i = 0; i < NUM_CHUNKS; i++) {
+        AudioBuffer* ptr = &buffers[i];
+        xQueueSend(emptyQueue, &ptr, portMAX_DELAY);
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
-    }
-    else {
-        Serial.println("\n[OK] WiFi connected.");
-        
+    setI2SData_recording();
 
-        // Time syncing
-
-        Serial.println("[SYSTEM] Syncing time...");
-        configTime(0, 0, "pool.ntp.org", "time.google.com");
-        
-        time_t now = time(nullptr);
-        int retry = 0;
-        while (now < 24 * 3600 && retry < 100) { 
-            delay(100); 
-            now = time(nullptr);
-            retry++;
-        }
-        
-        if (now < 24 * 3600) {
-            Serial.println("[WARNING] Time sync failed. SSL certificates might fail.");
-        } else {
-            Serial.println("[OK] Time synced.");
-        }
-    }
-
-    client_wifi.setInsecure(); 
-    setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+    // Create FreeRTOS Tasks
+    xTaskCreate(recordTask, "RecordTask", 4096, NULL, 5, NULL);
+    xTaskCreate(sdWriteTask, "SDWriteTask", 8192, NULL, 3, NULL);
 
 
-    // Audio Capture & Storage
+    // Audio Transcoding -------------------------
 
-    audioQueue = xQueueCreate(20, 64 * sizeof(int16_t));
-    xTaskCreate(recordTask, "Capture", 4096, NULL, 5, NULL);
-    xTaskCreate(sdWriteTask, "Writer", 4096, NULL, 3, NULL);
+    AudioInfo info_transcoding;
+    info_transcoding.sample_rate = 48000;
+    info_transcoding.channels = 1;
+    info_transcoding.bits_per_sample = 16;
 
-
-    // Audio Transcoding
-
-    AudioInfo info;
-    info.sample_rate = 48000;
-    info.channels = 1;
-    info.bits_per_sample = 16;
-
-    decoder_opusOgg.setAudioInfo(info);
-    encoder_wav.setAudioInfo(info);
+    decoder_opusOgg.setAudioInfo(info_transcoding);
+    encoder_wav.setAudioInfo(info_transcoding);
 
     // Create a queue capable of holding up to 5 pending transcode jobs
     jobQueue = xQueueCreate(5, sizeof(TranscodeJob));
@@ -312,6 +305,8 @@ void loop() {
         playbackQueue.pop(filePlaying);
         startPlayback(filePlaying);
     }
+
+    //vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 
@@ -719,6 +714,8 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
     return;
   }
 
+  Serial.println("Sending file...");
+
   size_t fileSize = f.size();
   WiFiClientSecure client_upload;
   client_upload.setInsecure();
@@ -761,11 +758,55 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
   Serial.println("Senden beendet.");
 }
 
+bool connectWiFi() {
+    // WiFi connection ----------------------------
+
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.print("[SYSTEM] Connecting to WiFi");
+    
+    unsigned long startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
+        return false;
+    }
+    else {
+        Serial.println("\n[OK] WiFi connected.");
+        
+
+        // Time syncing
+
+        Serial.println("[SYSTEM] Syncing time...");
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
+        
+        time_t now = time(nullptr);
+        int retry = 0;
+        while (now < 24 * 3600 && retry < 100) { 
+            delay(100); 
+            now = time(nullptr);
+            retry++;
+        }
+        
+        if (now < 24 * 3600) {
+            Serial.println("[WARNING] Time sync failed. SSL certificates might fail.");
+        } else {
+            Serial.println("[OK] Time synced.");
+        }
+    }
+
+    client_wifi.setInsecure(); 
+    return true;
+}
 
 
 
 
-// AUDIO PLAYBACK ==============================================
+
+// PLAYBACK ==============================================
 
 void startPlayback(const char* filePath) {
     if (isAudioRunning) stopPlayback();
@@ -778,10 +819,10 @@ void startPlayback(const char* filePath) {
     }
 
     // Prepare output stream for new file (resets decoder state)
-    out_stream.begin();
+    stream_wavToI2s.begin();
     
     // Point copier to newly opened file and output stream
-    copier_playback.begin(out_stream, audioFile);
+    copier_playback.begin(stream_wavToI2s, audioFile);
     
     isAudioRunning = true;
 
@@ -791,7 +832,7 @@ void startPlayback(const char* filePath) {
 void stopPlayback() {
     if (isAudioRunning) {
         isAudioRunning = false;
-        out_stream.end(); // Stop the decoder and stream cleanly
+        stream_wavToI2s.end(); // Stop the decoder and stream cleanly
         
         if (audioFile) audioFile.close();
 
@@ -810,149 +851,153 @@ void processAudio() {
     }
 }
 
-void setI2SPinout(int bclk, int lrck, int din) {
-    auto config = i2s.defaultConfig(TX_MODE);
-    config.pin_bck = bclk;
-    config.pin_ws = lrck;
-    config.pin_data = din;
-    i2s.begin(config);
+void setI2SData_playback() {
+    auto config = i2s_playback.defaultConfig(TX_MODE);
+    config.pin_bck = I2S_BCLK;
+    config.pin_ws = I2S_LRC;
+    config.pin_data = I2S_DOUT;
+    i2s_playback.begin(config);
 }
 
 
 
 
 
-// AUDIO RECORDING ======================================
+// RECORDING ======================================
 
 // Set things up for record task
 void startRecording() {
     if (isAudioRunning) stopPlayback();
 
-    const char *chatId = getChatId();
-    char folderPath[24];
-    snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
-
-    if (!SD.exists(folderPath))
-        SD.mkdir(folderPath);
-
-    // Clear previously received messages
-    cleanupChatFolder(folderPath, "received_");
-
-    // Create wav filepath with increased index
-    int fileIndex = getNextFileIndex(folderPath, "recorded_");
-    snprintf(currentFilePath, sizeof(currentFilePath), "%s/recorded_%03d.wav", folderPath, fileIndex);
-    audioFile = SD.open(currentFilePath, FILE_WRITE);
-
-    uint8_t header[44] = {0};
-    audioFile.write(header, 44);
-    bytesRecorded = 0;
     isRecording = true;
-    setupI2S_record();
-
-    Serial.println("Aufnahme gestartet...");
 }
 
-// FreeRTOS task to do the actual recording
 void recordTask(void *pvParameters) {
-  while (true) {
-    if (isRecording) {
-      int16_t buffer[128];
-      size_t bytesRead = 0;
-      if(i2s_channel_read(rx_handle, buffer, sizeof(buffer), &bytesRead, 100) == ESP_OK) {
-        int16_t monoBuffer[64];
-        for(int i = 0; i < (bytesRead / 4); i++) {
-            monoBuffer[i] = buffer[i * 2];
+    AudioBuffer* buf; // Struct that the xQueueReceive call will fill with recorded data
+    
+    while (true) {
+        if (isRecording) {
+            // Get an empty buffer from emptyQueue
+            if (xQueueReceive(emptyQueue, &buf, pdMS_TO_TICKS(10)) == pdTRUE) {
+                // Read audio data from microphone
+                size_t bytes_read = i2s_record.readBytes(buf->data, CHUNK_SIZE);
+                
+                if (bytes_read > 0) {
+                    size_t mono_size = 0;
+                    for (size_t i = 0; i < bytes_read; i += 4) { 
+                        // A 16-bit stereo frame is 4 bytes
+                        buf->data[mono_size++] = buf->data[i];
+                        buf->data[mono_size++] = buf->data[i + 1];
+                        // i+2 and i+3 (Right channel) are ignored
+                    }
+                    buf->size = mono_size;
+                    // Send filled buffer to the writing task
+                    xQueueSend(fullQueue, &buf, portMAX_DELAY);
+                } else {
+                    // Nothing read, return buffer to empty queue
+                    xQueueSend(emptyQueue, &buf, portMAX_DELAY);
+                }
+            } else {
+                Serial.println("Warning: Queue Full/Buffer Overflow! SD card too slow.");
+                // Prevent task watchdogs from panicking during overflow
+                vTaskDelay(pdMS_TO_TICKS(5)); 
+            }
+        } else {
+            // Sleep briefly when not recording
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
-        xQueueSend(audioQueue, monoBuffer, pdMS_TO_TICKS(10));
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(50)); 
-      }
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(50)); 
     }
-  }
 }
 
 // FreeRTOS task to store recorded bytes on sd card
 void sdWriteTask(void *pvParameters) {
-  while (true) {
-    if(isRecording) {
-        int16_t buffer[64];
-        if (xQueueReceive(audioQueue, buffer, pdMS_TO_TICKS(100))) {
-            audioFile.write((uint8_t*)buffer, sizeof(buffer));
-            bytesRecorded += sizeof(buffer);
+    AudioBuffer* buf;
+    
+    while (true) {
+        if (isRecording) {
+            // Check if we just started recording
+            if (!wasRecording) {
+
+                // Build folderpath and ensure it exists
+                const char *chatId = getChatId();
+                char folderPath[24];
+                snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
+
+                if (!SD.exists(folderPath))
+                    SD.mkdir(folderPath);
+
+                // Create wav filepath with increased index
+                int fileIndex = getNextFileIndex(folderPath, "recorded_");
+                snprintf(currentFilePath, sizeof(currentFilePath), "%s/recorded_%03d.wav", folderPath, fileIndex);
+                audioFile_record = SD.open(currentFilePath, FILE_WRITE);
+
+                // Clear previously received messages in folder
+                cleanupChatFolder(folderPath, "received_");
+
+                // Start recording
+                if (audioFile_record) {
+                    encoderWav_record.setAudioInfo(info_WavEncoder);
+                    stream_wavToFile.begin(info_WavEncoder); // WAV header must match the mono 16-bit PCM we actually write
+                    wasRecording = true;
+                    Serial.println("Recording started...");
+                }
+                else {
+                    Serial.println("Failed to open file for writing!");
+                    isRecording = false; // Abort
+                }
+            }
+
+            // Wait for a filled buffer (timeout 50ms to allow checking isRecording again)
+            if (xQueueReceive(fullQueue, &buf, pdMS_TO_TICKS(50)) == pdTRUE) {
+                // Write audio data to SD Card
+                stream_wavToFile.write(buf->data, buf->size);
+                
+                // Return buffer to empty queue for reuse
+                xQueueSend(emptyQueue, &buf, portMAX_DELAY);
+            }
+            
+        } else {
+            // Check if we just stopped recording
+            if (wasRecording) {
+
+                // Flush any remaining buffers in the queue
+                while (xQueueReceive(fullQueue, &buf, 0) == pdTRUE) {
+                    stream_wavToFile.write(buf->data, buf->size);
+                    xQueueSend(emptyQueue, &buf, portMAX_DELAY);
+                }
+                
+                // Finalize the WAV file (rewrites header with final RIFF size)
+                stream_wavToFile.end();
+                audioFile_record.close();
+                wasRecording = false;
+                
+                Serial.println("Recording stopped.");
+            }
+            // Sleep briefly when not recording
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
-    } else {
-        vTaskDelay(pdMS_TO_TICKS(50)); 
     }
-  }
 }
 
 // Tie things up after recording is done
 void finishRecording() {
   isRecording = false;
-  stopI2S_record();
-  audioFile.seek(0);
-  writeWavHeader(audioFile, bytesRecorded);
-  audioFile.close();
-  //setI2SPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
 
-  Serial.println("Aufnahme beendet. Senden wird vorbereitet...");
   sendWavFile(currentFilePath, "message.wav", getChatId());
 }
 
-void setupI2S_record() {
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  i2s_new_channel(&chan_cfg, NULL, &rx_handle);
-
-  i2s_std_config_t std_cfg = {
-    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-    .gpio_cfg = {
-      .mclk = I2S_GPIO_UNUSED,
-      .bclk = (gpio_num_t)I2S_BCLK,
-      .ws = (gpio_num_t)I2S_LRC,
-      .dout = I2S_GPIO_UNUSED,
-      .din = (gpio_num_t)I2S_DIN,
-    }
-  };
-
-  i2s_channel_init_std_mode(rx_handle, &std_cfg);
-  i2s_channel_enable(rx_handle);
+void setI2SData_recording() {
+    auto config = i2s_record.defaultConfig(RX_MODE);
+    config.sample_rate = info_recording.sample_rate;
+    config.channels = info_recording.channels;
+    config.bits_per_sample = info_recording.bits_per_sample;
+    config.i2s_format = I2S_STD_FORMAT;
+    config.pin_ws = I2S_LRC;
+    config.pin_bck = I2S_BCLK;
+    config.pin_data = I2S_DIN;
+    config.pin_data_rx = I2S_DIN;
+    i2s_record.begin(config);
 }
-
-void stopI2S_record() {
-  if (rx_handle) {
-    i2s_channel_disable(rx_handle);
-    i2s_del_channel(rx_handle);
-    rx_handle = NULL;
-  }
-}
-
-void writeWavHeader(File file, uint32_t fileSize) {
-  uint32_t sampleRate = SAMPLE_RATE;
-  uint16_t numChannels = 1;
-  uint16_t bitsPerSample = 16;
-  uint32_t byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-  file.write((const uint8_t*)"RIFF", 4);
-  uint32_t chunkSize = fileSize + 36;
-  file.write((const uint8_t*)&chunkSize, 4);
-  file.write((const uint8_t*)"WAVE", 4);
-  file.write((const uint8_t*)"fmt ", 4);
-  uint32_t subchunk1Size = 16;
-  file.write((const uint8_t*)&subchunk1Size, 4);
-  uint16_t audioFormat = 1;
-  file.write((const uint8_t*)&audioFormat, 2);
-  file.write((const uint8_t*)&numChannels, 2);
-  file.write((const uint8_t*)&sampleRate, 4);
-  file.write((const uint8_t*)&byteRate, 4);
-  uint16_t blockAlign = numChannels * (bitsPerSample / 8);
-  file.write((const uint8_t*)&blockAlign, 2);
-  file.write((const uint8_t*)&bitsPerSample, 2);
-  file.write((const uint8_t*)"data", 4);
-  file.write((const uint8_t*)&fileSize, 4);
-}
-
 
 
 
@@ -988,7 +1033,7 @@ void transcodeTask(void *pvParameters) {
             }
 
             // Set up audio information
-            AudioInfo info(48000, 1, 16);
+            AudioInfo info_transcoding(48000, 1, 16);
             decoder_opusOgg.addNotifyAudioChange(encoder_wav); // Decoder notifies the encoder in case ogg file has different audio info
 
             // Ensure PSRAM is initialized and available
@@ -997,10 +1042,10 @@ void transcodeTask(void *pvParameters) {
                 continue;
             }
 
-            dec_stream.resizeReadResultQueue(131072); // Large enough to hold raw PCM bytes worth of one page of decoded ogg/opus bytes
+            stream_OggToFileIn.resizeReadResultQueue(131072); // Large enough to hold raw PCM bytes worth of one page of decoded ogg/opus bytes
 
-            dec_stream.begin(info);
-            enc_stream.begin(info);
+            stream_OggToFileIn.begin(info_transcoding);
+            stream_WavToFileOut.begin(info_transcoding);
 
             int flushCounter = 0;
 
@@ -1027,8 +1072,8 @@ void transcodeTask(void *pvParameters) {
             }
 
             // Cleanup memory and close files for this job
-            enc_stream.end();
-            dec_stream.end();
+            stream_WavToFileOut.end();
+            stream_OggToFileIn.end();
             audioFileIn.close();
             audioFileOut.close();
 
