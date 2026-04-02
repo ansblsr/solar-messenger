@@ -231,8 +231,8 @@ void setup() {
     pinMode(BUTTON, INPUT_PULLUP);
     pinMode(BUTTON_DIAL, INPUT_PULLUP);
 
-    AudioLogger::instance().begin(Serial, AudioLogger::Debug);
-    
+    //AudioLogger::instance().begin(Serial, AudioLogger::Debug);
+
     Serial.println("\n[SYSTEM] Initializing...");
     
 
@@ -565,6 +565,9 @@ bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
 // RECEIVING 
 
 bool processTelegramUpdates() {
+
+    tryConnectWiFi(10000); // ensure WiFi connection
+
     Serial.println("Telegram API: /getUpdates");
 
     bool ret = false;
@@ -709,54 +712,57 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
 // SENDING
 
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id) {
-  File f = SD.open(filePath);
-  if (!f) {
-    Serial.println("[ERROR] Could not open file for upload");
-    return;
-  }
 
-  Serial.println("Sending file...");
+    tryConnectWiFi(10000); // ensure WiFi connection
 
-  size_t fileSize = f.size();
-  WiFiClientSecure client_upload;
-  client_upload.setInsecure();
+    File f = SD.open(filePath);
+    if (!f) {
+        Serial.println("[ERROR] Could not open file for upload");
+        return;
+    }
 
-  if (!client_upload.connect("api.telegram.org", 443)) {
-    Serial.println("[ERROR] Connection to Telegram failed");
+    Serial.println("Sending file...");
+
+    size_t fileSize = f.size();
+    WiFiClientSecure client_upload;
+    client_upload.setInsecure();
+
+    if (!client_upload.connect("api.telegram.org", 443)) {
+        Serial.println("[ERROR] Connection to Telegram failed");
+        f.close();
+        return;
+    }
+
+    String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    String partHeader = "--" + boundary + "\r\n"
+                        "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+                        + chat_id + "\r\n"
+                        "--" + boundary + "\r\n"
+                        "Content-Disposition: form-data; name=\"document\"; filename=\""
+                        + fileName + "\"\r\n"
+                        "Content-Type: audio/wav\r\n\r\n";
+    String partFooter = "\r\n--" + boundary + "--\r\n";
+    size_t totalLength = partHeader.length() + fileSize + partFooter.length();
+
+    client_upload.println("POST /bot" + String(BOT_TOKEN) + "/sendDocument HTTP/1.1");
+    client_upload.println("Host: api.telegram.org");
+    client_upload.println("Content-Type: multipart/form-data; boundary=" + boundary);
+    client_upload.println("Content-Length: " + String(totalLength));
+    client_upload.println("Connection: close");
+    client_upload.println();
+    client_upload.print(partHeader);
+
+    uint8_t buf[512];
+    while (f.available()) {
+        size_t n = f.read(buf, sizeof(buf));
+        client_upload.write(buf, n);
+    }
     f.close();
-    return;
-  }
 
-  String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
-  String partHeader = "--" + boundary + "\r\n"
-                      "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
-                      + chat_id + "\r\n"
-                      "--" + boundary + "\r\n"
-                      "Content-Disposition: form-data; name=\"document\"; filename=\""
-                      + fileName + "\"\r\n"
-                      "Content-Type: audio/wav\r\n\r\n";
-  String partFooter = "\r\n--" + boundary + "--\r\n";
-  size_t totalLength = partHeader.length() + fileSize + partFooter.length();
+    client_upload.print(partFooter);
 
-  client_upload.println("POST /bot" + String(BOT_TOKEN) + "/sendDocument HTTP/1.1");
-  client_upload.println("Host: api.telegram.org");
-  client_upload.println("Content-Type: multipart/form-data; boundary=" + boundary);
-  client_upload.println("Content-Length: " + String(totalLength));
-  client_upload.println("Connection: close");
-  client_upload.println();
-  client_upload.print(partHeader);
-
-  uint8_t buf[512];
-  while (f.available()) {
-    size_t n = f.read(buf, sizeof(buf));
-    client_upload.write(buf, n);
-  }
-  f.close();
-
-  client_upload.print(partFooter);
-
-  client_upload.stop();
-  Serial.printf("Senden beendet. %s", chat_id);
+    client_upload.stop();
+    Serial.printf("Senden beendet. %s", chat_id);
 }
 
 bool tryConnectWiFi(int timeout_ms) {
@@ -887,11 +893,30 @@ void recordTask(void *pvParameters) {
                 
                 if (bytes_read > 0) {
                     size_t mono_size = 0;
-                    for (size_t i = 0; i < bytes_read; i += 4) { 
-                        // A 16-bit stereo frame is 4 bytes
-                        buf->data[mono_size++] = buf->data[i];
-                        buf->data[mono_size++] = buf->data[i + 1];
-                        // i+2 and i+3 (Right channel) are ignored
+                    const float gain = 6.0f; // Adjust gain factor as needed (e.g., 1.5f for 50% increase)
+                    for (size_t i = 0; i < bytes_read; i += 8) { 
+                        // A 32-bit stereo frame is 8 bytes: left (4 bytes), right (4 bytes)
+                        // Extract left channel as 32-bit signed integer (assuming little-endian)
+                        int32_t left = (buf->data[i+3] << 24) | (buf->data[i+2] << 16) | (buf->data[i+1] << 8) | buf->data[i];
+                        
+                        // Shift right by 8 bits to reduce to 24-bit
+                        left >>= 8;
+                        
+                        // Apply gain
+                        left = (int32_t)(left * gain);
+                        
+                        // Convert to 16-bit by taking the upper 16 bits of the 24-bit value
+                        int16_t sample = (int16_t)(left >> 8);
+
+                        // Apply clamping in case of clipping
+                        if(sample > 32767) sample = 32767;
+                        else if(sample < -32768) sample = -32768;
+                        
+                        // Write the 16-bit sample to the buffer (little-endian)
+                        buf->data[mono_size++] = sample & 0xFF;
+                        buf->data[mono_size++] = (sample >> 8) & 0xFF;
+                        
+                        // Right channel (i+4 to i+7) is ignored
                     }
                     buf->size = mono_size;
                     // Send filled buffer to the writing task
@@ -985,9 +1010,6 @@ void sdWriteTask(void *pvParameters) {
 // Tie things up after recording is done
 void finishRecording() {
     isRecording = false;
-
-    // ensure WiFi connection
-    tryConnectWiFi(10000);
 
     // Give a little time and send as soon as recording actually stopped
     unsigned long tp = millis();
