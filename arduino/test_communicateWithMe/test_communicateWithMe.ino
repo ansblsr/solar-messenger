@@ -31,24 +31,22 @@ bool processTelegramUpdates();
 void startPlayback(const char* filePath);
 const char* getChatId();
 int findChatId(const char* chatId);
+//void handleButton(Button &btn, const char* name);
+void convertExtension_ogg2wav(const char* oggStr, char* wavStr);
+int getNextFileIndex(const char* folderPath, const char* prefix);
+bool tryConnectWiFi(int timeout_ms);
+void stopPlayback();
+void processAudio();
+void setI2SData_playback();
+void recordTask(void *pvParameters);
+void sdWriteTask(void *pvParameters);
+void setI2SData_recording();
+void addTranscodeJob(const char* oggFile, const char* wavFile);
+void transcodeTask(void *pvParameters);
 
 // ==========================================================================================
 
-// COMMUNICATION =======================
-
-// I2S Pins
-#define I2S_DOUT  8
-#define I2S_DIN   7
-#define I2S_BCLK  5
-#define I2S_LRC   6
-
-// SD Card Pin
-#define SD_CS     D10
-
-#define SAMPLE_RATE 16000
-
-
-// BUTTONS ==============================
+// USER CONTROL ==============================
 
 #define BUTTON A5
 #define BUTTON_DIAL A4
@@ -72,7 +70,7 @@ Button button = {BUTTON, HIGH, 0, false, false, playNewMessage, startRecording, 
 Button button_dial = {BUTTON_DIAL, HIGH, 0, false, false, dialUp, playLastMessagesWrapper, doNothing};
 
 
-// PLAYBACK ==============================
+// CHAT & PLAYBACK CONTROL ===========================
 
 #define QUEUE_SIZE 20 // maximum expected number of files
 #define MAX_PATH_LEN 64 // maximum path length
@@ -140,7 +138,27 @@ int chat_index = 0;
 bool newMessages[max_chats] = {false};
 
 
-// Audio Player
+// NETWORK COMMUNICATION =============================
+
+WiFiClientSecure client_wifi;
+
+long lastUpdateId = 0;
+i2s_chan_handle_t rx_handle = NULL;
+
+
+// INTERNAL COMMUNICATION =======================
+
+// I2S Pins
+#define I2S_DOUT  8
+#define I2S_DIN   7
+#define I2S_BCLK  5
+#define I2S_LRC   6
+
+// SD Card Pin
+#define SD_CS     D10
+
+
+// AUDIO PLAYBACK ===========================
 
 bool isAudioRunning = false;
 File audioFile;
@@ -151,7 +169,8 @@ EncodedAudioStream stream_wavToI2s(&i2s_playback, &decoder_wav); // data written
 StreamCopy copier_playback(stream_wavToI2s, audioFile); // pulls bytes from sd-file and pushes them to stream_wavToI2s
 
 
-// RECORDING =========================
+
+// AUDIO RECORDING =========================
 // Mic → I2SStream → AudioStream → WAVEncoder → File
 
 I2SStream i2s_record;
@@ -181,7 +200,7 @@ QueueHandle_t emptyQueue;
 QueueHandle_t fullQueue;
 
 
-// TRANSCODING ============================
+// AUDIO TRANSCODING ============================
 // file.ogg --> OpusOggDecoder --StreamCopy--> WavEncoder --> File.wav
 
 // Struct to pass jobs to the FreeRTOS task
@@ -207,16 +226,9 @@ EncodedAudioStream stream_WavToFileOut(&audioFileOut, &encoder_wav);
 StreamCopy copier_transcode(stream_WavToFileOut, stream_OggToFileIn, 16384);
 
 
-// NETWORKING =========================
-
-WiFiClientSecure client_wifi;
-
-long lastUpdateId = 0;
-i2s_chan_handle_t rx_handle = NULL;
-
-
 
 // =============================================================================================
+
 // =============================================================================================
 
 
@@ -560,7 +572,7 @@ bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
 
 
 
-// TELEGRAM COMMS ================================
+// NETWORK COMMUNICATION ================================
 
 // RECEIVING 
 
@@ -815,7 +827,7 @@ bool tryConnectWiFi(int timeout_ms) {
 
 
 
-// PLAYBACK ==============================================
+// AUDIO PLAYBACK ==============================================
 
 void startPlayback(const char* filePath) {
     if (isAudioRunning) stopPlayback();
@@ -872,7 +884,7 @@ void setI2SData_playback() {
 
 
 
-// RECORDING ======================================
+// AUDIO RECORDING ======================================
 
 // Set things up for record task
 void startRecording() {
@@ -1035,6 +1047,7 @@ void setI2SData_recording() {
     config.pin_data_rx = I2S_DIN;
     i2s_record.begin(config);
 }
+
 
 
 
