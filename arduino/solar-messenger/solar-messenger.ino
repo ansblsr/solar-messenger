@@ -20,12 +20,13 @@ void startRecording();
 void finishRecording();
 void dialUp();
 void doNothing();
-void playLastMessagesWrapper();
-void playLastMessages(const char* chatId, bool transcodeOgg);
-bool isValidChat(const char* chat_id, int* printIndex = nullptr);
+void playChatWrapper();
+void playChat(const char* chatId, bool transcodeOgg);
+bool isValidChat(const char* chat_id, int* printIndex_optional = nullptr);
 bool downloadTelegramFile(const char* fileId, const char* destination);
 bool transcodeOggToWav(const char* oggPath, const char* wavPath);
 void cleanupChatFolder(const char* folderPath, const char* prefix);
+bool hasChatsWithNews(int* printNumber_optional = nullptr);
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id);
 bool processTelegramUpdates();
 void startPlayback(const char* filePath);
@@ -67,7 +68,7 @@ struct Button {
 };
 
 Button button = {BUTTON, HIGH, 0, false, false, playNewMessage, startRecording, finishRecording};
-Button button_dial = {BUTTON_DIAL, HIGH, 0, false, false, dialUp, playLastMessagesWrapper, doNothing};
+Button button_dial = {BUTTON_DIAL, HIGH, 0, false, false, dialUp, playChatWrapper, doNothing};
 
 
 // CHAT & PLAYBACK CONTROL ===========================
@@ -136,6 +137,69 @@ PlaybackQueue playbackQueue;
 
 int chat_index = 0;
 bool newMessages[max_chats] = {false};
+
+
+// BATTERY & SYSTEM BEHAVIOR =========================
+
+struct Battery {
+    int level = 50;
+
+    int cost_send = 30;
+    int cost_update = 30;
+    int cost_listen = 5;
+
+    unsigned long tp_lastRefresh;
+
+    void chargeBy(int points) {
+        level += points;
+        if (level > 100) level = 100;
+    }
+
+    bool canSend() {
+        if (level >= cost_send) {
+            return true;
+        } else {
+            Serial.println("[BATTERY] Action not possible, need more sun :)1");
+            return false;
+        };
+    }
+
+    bool canFetch() {
+        if (level >= cost_update) {
+            return true;
+        } else {
+            Serial.println("[BATTERY] Action not possible, need more sun :)2");
+            return false;
+        };
+    }
+
+    bool canListen() {
+        if (level >= cost_listen) {
+            return true;
+        } else {
+            Serial.println("[BATTERY] Action not possible, need more sun :)3");
+            return false;
+        };
+    }
+
+    void subtractSend() {
+        level -= cost_send;
+    }
+
+    void subtractUpdate() {
+        level -= cost_update;
+    }
+
+    void subtractListen() {
+        level -= cost_listen;
+    }
+};
+
+Battery battery;
+#define INTERVAL_BATTERY_UPDATE 30000
+
+unsigned long tp_lastFetch = 0;
+#define INTERVAL_AUTO_FETCH 180000 //39600000 // 11h in ms
 
 
 // NETWORK COMMUNICATION =============================
@@ -243,6 +307,8 @@ void setup() {
     pinMode(BUTTON, INPUT_PULLUP);
     pinMode(BUTTON_DIAL, INPUT_PULLUP);
 
+    pinMode(LED_BUILTIN, OUTPUT);
+
     //AudioLogger::instance().begin(Serial, AudioLogger::Debug);
 
     Serial.println("\n[SYSTEM] Initializing...");
@@ -310,19 +376,28 @@ void setup() {
 
 void loop() {
     processAudio();
+
     handleButton(button, "button");
     handleButton(button_dial, "dial");
+
+    if(!isRecording && !isAudioRunning) {
+        unsigned long tp_now = millis();
+        handleBattery(tp_now);
+        handleBehavior(tp_now);
+    }
 
     if(!isAudioRunning && playbackQueue.hasNext()) {
         static char filePlaying[MAX_PATH_LEN];
         playbackQueue.pop(filePlaying);
         startPlayback(filePlaying);
     }
-
-    //vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 
+
+// =============================================================================================
+
+// =============================================================================================
 
 
 
@@ -342,7 +417,7 @@ void handleButton(Button &btn, const char* name) {
   // Button Released (Rising edge)
   if (currentState == HIGH && btn.lastState == LOW) {
     if (!btn.isHolding) {
-      Serial.print(name); Serial.println(": Short Press");
+      Serial.printf("%s: Short Press\n", name);
       if (btn.onShortPress) btn.onShortPress();
     } 
     else { 
@@ -353,7 +428,7 @@ void handleButton(Button &btn, const char* name) {
 
   // Check for Long Press
   if (btn.isPressed && !btn.isHolding && (millis() - btn.pressStartTime > SHORT_PRESS_TIME)) {
-    Serial.print(name); Serial.println(": Long Press (Hold)");
+    Serial.printf("%s: Long Press (Hold)\n", name);
     if (btn.onHold) btn.onHold();
     btn.isHolding = true;
   }
@@ -367,7 +442,7 @@ void dialUp() {
     if(isRecording) return;
 
     chat_index = (chat_index + 1) % max_chats;
-    Serial.print("[DIAL] Changed chat to index: "); Serial.println(chat_index);
+    Serial.printf("[DIAL] Changed chat to index: %d \n", chat_index);
     Serial.print("New Messages: "); 
     for(int i = 0; i < 5; i++) {
       Serial.print(newMessages[i]);
@@ -381,18 +456,17 @@ void dialUp() {
 
 // CHAT & PLAYBACK CONTROL ==============================
 
+// Plays a new message, either already on device or fetched. For the user, this acts like it goes online everytime
 void playNewMessage() {
     if(isAudioRunning) return;
     if(isRecording) return;
+    if (!battery.canFetch()) return;
+
+    int chatsWithNews = 0; // Will hold number of chats with new messages
 
     // See if there already are chats that have unlistened messages in them
-    int chatsWithNews = 0; // Number of chats with new messages
-    for(int i = 0; i < max_chats; i++) {
-        if(newMessages[i]) chatsWithNews++;
-    }
-
     // If yes, pick a random one of them
-    if(chatsWithNews > 0) {
+    if(hasChatsWithNews(&chatsWithNews)) {
         int chats_indices[max_chats]; // will hold the chatIndices of all chats containing unlistened messages
         int j = 0;
         for(int i = 0; i < max_chats; i++) {
@@ -402,7 +476,7 @@ void playNewMessage() {
 
         chat_index = randomChatIndex;
 
-        playLastMessages(chat_ids[chats_indices[randomChatIndex]], true); // play it back, transcode if necessary
+        playChat(chat_ids[chats_indices[randomChatIndex]], true); // play it back, transcode if necessary
     }
 
     // If no, fetch telegram servers
@@ -410,14 +484,18 @@ void playNewMessage() {
         if(processTelegramUpdates()) playNewMessage(); // fetch and if new messages, try again
         else Serial.println("[MESSAGE] No new messages :(");
     }
+
+    battery.subtractUpdate();
 }
 
-void playLastMessagesWrapper() {
-  playLastMessages(getChatId(), true);
+void playChatWrapper() {
+    if (!battery.canListen()) return;
+    playChat(getChatId(), true);
+    battery.subtractListen();
 }
 
 // Play the last messages in a chat folder, transcode them if specified
-void playLastMessages(const char* chatId, bool transcodeOgg) {
+void playChat(const char* chatId, bool transcodeOgg) {
     if (isRecording) return;
     if (isAudioRunning) stopPlayback();
 
@@ -543,6 +621,24 @@ void cleanupChatFolder(const char* folderPath, const char* prefix) {
     dir.close();
 }
 
+// Tells whether there are new messages already on the device
+bool hasChatsWithNews(int* printNumber_optional) {
+    if (printNumber_optional == nullptr) {
+        for(int i = 0; i < max_chats; i++) {
+            if(newMessages[i]) return true;
+        }
+        return false;
+    } 
+    else {
+        int chatsWithNews = 0;
+        for(int i = 0; i < max_chats; i++) {
+            if(newMessages[i]) chatsWithNews++;
+        }
+        *printNumber_optional = chatsWithNews;
+        return chatsWithNews > 0;
+    }
+}
+
 // Get chatId by chatIndex
 const char* getChatId() {
     return chat_ids[chat_index];
@@ -557,15 +653,48 @@ int findChatId(const char* chatId) {
 }
 
 // Is this chatId within the contacts?
-bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
+bool isValidChat(const char* chat_id, int* printIndex_optional) {
     for (int i = 0; i < max_chats; i++)
     {
         if(strcmp(chat_id, chat_ids[i]) == 0) {
-            if(printIndex != nullptr) *printIndex = i;
+            if(printIndex_optional != nullptr) *printIndex_optional = i;
             return true;
         }
     }
     return false;
+}
+
+
+
+
+
+// BATTERY & SYSTEM BEHAVIOR ============================
+
+void handleBattery(unsigned long tp_now) {
+    if (tp_now - battery.tp_lastRefresh > INTERVAL_BATTERY_UPDATE && battery.level < 100) {
+
+        battery.chargeBy(10);
+        Serial.printf("Battery level: %d\n", battery.level);
+
+        battery.tp_lastRefresh = tp_now;
+    }
+}
+
+void handleBehavior(unsigned long tp_now) {
+    unsigned long timeSinceLastFetch = tp_now - tp_lastFetch;
+
+    // Fetch every 11h no matter what, to make sure no messages get lost on telegrams servers (after 24h)
+    if (timeSinceLastFetch > INTERVAL_AUTO_FETCH) {
+        processTelegramUpdates();
+        //tp_lastFetch = tp_now;
+    }
+
+    // If there is battery, no new messages on device, last fetch more than 30mins ago, fetch automatically
+    else if (timeSinceLastFetch > 120000/*1800000 /*30min*/ && battery.level >= 80 && !hasChatsWithNews()) {
+        processTelegramUpdates();
+        battery.subtractUpdate();
+        //tp_lastFetch = tp_now;
+    }
 }
 
 
@@ -578,11 +707,12 @@ bool isValidChat(const char* chat_id, int* printIndex /*optional*/) {
 
 bool processTelegramUpdates() {
 
-    tryConnectWiFi(10000); // ensure WiFi connection
+    bool ret = false;
+
+    // ensure WiFi connection
+    if (!tryConnectWiFi(10000)) return false;
 
     Serial.println("Telegram API: /getUpdates");
-
-    bool ret = false;
 
     char getUpdates_url[256];
     snprintf(getUpdates_url, sizeof(getUpdates_url), "https://api.telegram.org/bot%s/getUpdates?offset=%ld&limit=5", BOT_TOKEN, lastUpdateId + 1);
@@ -592,13 +722,19 @@ bool processTelegramUpdates() {
     int httpCode = http_getFile.GET();
     
     if (httpCode == HTTP_CODE_OK) {
+
+        tp_lastFetch = millis();
+
         WiFiClient* stream = http_getFile.getStreamPtr();
         JsonDocument doc_updates;
         DeserializationError error = deserializeJson(doc_updates, *stream);
 
         if(!error) {
             JsonArray results = doc_updates["result"].as<JsonArray>();
-            
+
+            if (results.size() == 0) {
+                Serial.println("[OK] No new messages found");
+            }
 
             // For every new message
             for (JsonObject currentResult : results) {
@@ -664,7 +800,7 @@ bool processTelegramUpdates() {
                 }
             }
         } else {
-            Serial.print("[ERROR] Parsing failed: "); Serial.println(error.c_str());
+            Serial.printf("[ERROR] Parsing failed: %s\n", error.c_str());
         }
     }
     http_getFile.end();
@@ -774,7 +910,7 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
     client_upload.print(partFooter);
 
     client_upload.stop();
-    Serial.printf("Senden beendet. %s", chat_id);
+    Serial.printf("Senden beendet. %s\n", chat_id);
 }
 
 bool tryConnectWiFi(int timeout_ms) {
@@ -888,6 +1024,7 @@ void setI2SData_playback() {
 
 // Set things up for record task
 void startRecording() {
+    if (!battery.canSend()) return;
     if (isAudioRunning) stopPlayback();
 
     isRecording = true;
@@ -1021,6 +1158,8 @@ void sdWriteTask(void *pvParameters) {
 
 // Tie things up after recording is done
 void finishRecording() {
+    if (!isRecording) return; // Button was released but recording couldn't even be started
+
     isRecording = false;
 
     // Give a little time and send as soon as recording actually stopped
@@ -1028,11 +1167,13 @@ void finishRecording() {
     while (millis() - tp < 2000) {
         if(!wasRecording) {
             sendWavFile(currentFilePath, "message.wav", getChatId());
+            battery.subtractSend();
             return;
         }
     }
     
     Serial.println("[ERROR] Sending failed.");
+    battery.subtractSend();
 }
 
 void setI2SData_recording() {
