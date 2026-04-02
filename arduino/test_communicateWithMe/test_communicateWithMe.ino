@@ -155,13 +155,13 @@ StreamCopy copier_playback(stream_wavToI2s, audioFile); // pulls bytes from sd-f
 // Mic → I2SStream → AudioStream → WAVEncoder → File
 
 I2SStream i2s_record;
+AudioInfo info_recording(16000, 2, 32); // for the I2S Stream [sample-rate, num_channels, bits per sample]
 
 WAVEncoder encoderWav_record;
-AudioInfo info_WavEncoder(16000, 1, 16); // [sample-rate, num_channels, bits per sample]
+AudioInfo info_WavEncoder(16000, 1, 16); // for Wav Encoder AND EncodedStream (must match) [sample-rate, num_channels, bits per sample]
 
 File audioFile_record;
 EncodedAudioStream stream_wavToFile(&audioFile_record, &encoderWav_record);
-AudioInfo info_recording(16000, 2, 16); // for the I2S Stream [sample-rate, num_channels, bits per sample]
 
 volatile bool isRecording = false;
 bool wasRecording = false;
@@ -244,7 +244,8 @@ void setup() {
     Serial.println("[OK] SD Card Initialized.");
 
 
-    if (!connectWiFi()) while(1);
+    // WiFi connection
+    tryConnectWiFi(30000);
 
     setI2SData_playback();
 
@@ -755,17 +756,19 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
   client_upload.print(partFooter);
 
   client_upload.stop();
-  Serial.println("Senden beendet.");
+  Serial.printf("Senden beendet. %s", chat_id);
 }
 
-bool connectWiFi() {
-    // WiFi connection ----------------------------
+bool tryConnectWiFi(int timeout_ms) {
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }
 
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("[SYSTEM] Connecting to WiFi");
     
     unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout_ms) {
         delay(500);
         Serial.print(".");
     }
@@ -981,9 +984,21 @@ void sdWriteTask(void *pvParameters) {
 
 // Tie things up after recording is done
 void finishRecording() {
-  isRecording = false;
+    isRecording = false;
 
-  sendWavFile(currentFilePath, "message.wav", getChatId());
+    // ensure WiFi connection
+    tryConnectWiFi(10000);
+
+    // Give a little time and send as soon as recording actually stopped
+    unsigned long tp = millis();
+    while (millis() - tp < 2000) {
+        if(!wasRecording) {
+            sendWavFile(currentFilePath, "message.wav", getChatId());
+            return;
+        }
+    }
+    
+    Serial.println("[ERROR] Sending failed.");
 }
 
 void setI2SData_recording() {
