@@ -19,6 +19,7 @@ void playNewMessage();
 void startRecording();
 void finishRecording();
 void dialUp();
+void setLED (bool state);
 void doNothing();
 void playChatWrapper();
 void playChat(const char* chatId, bool transcodeOgg);
@@ -28,6 +29,7 @@ bool transcodeOggToWav(const char* oggPath, const char* wavPath);
 void cleanupChatFolder(const char* folderPath, const char* prefix);
 bool hasChatsWithNews(int* printNumber_optional = nullptr);
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id);
+bool fetchMessages();
 bool processTelegramUpdates();
 void startPlayback(const char* filePath);
 const char* getChatId();
@@ -47,10 +49,13 @@ void transcodeTask(void *pvParameters);
 
 // ==========================================================================================
 
-// USER CONTROL ==============================
+// USER INTERFACE ==============================
 
 #define BUTTON A5
 #define BUTTON_DIAL A4
+
+#define LED_NOTIFICATION A3
+bool state_LED = false;
 
 const unsigned long SHORT_PRESS_TIME = 500; // Threshold for long press
 
@@ -196,10 +201,10 @@ struct Battery {
 };
 
 Battery battery;
-#define INTERVAL_BATTERY_UPDATE 30000
+#define INTERVAL_BATTERY_UPDATE 50000
 
 unsigned long tp_lastFetch = 0;
-#define INTERVAL_AUTO_FETCH 180000 //39600000 // 11h in ms
+#define INTERVAL_AUTO_FETCH 39600000 // 11h in ms
 
 
 // NETWORK COMMUNICATION =============================
@@ -267,6 +272,8 @@ QueueHandle_t fullQueue;
 // AUDIO TRANSCODING ============================
 // file.ogg --> OpusOggDecoder --StreamCopy--> WavEncoder --> File.wav
 
+bool isTranscoding = false;
+
 // Struct to pass jobs to the FreeRTOS task
 struct TranscodeJob {
     char inFile[MAX_PATH_LEN];
@@ -307,7 +314,8 @@ void setup() {
     pinMode(BUTTON, INPUT_PULLUP);
     pinMode(BUTTON_DIAL, INPUT_PULLUP);
 
-    pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(LED_NOTIFICATION, OUTPUT);
+    digitalWrite(LED_NOTIFICATION, LOW);
 
     //AudioLogger::instance().begin(Serial, AudioLogger::Debug);
 
@@ -342,8 +350,8 @@ void setup() {
     setI2SData_recording();
 
     // Create FreeRTOS Tasks
-    xTaskCreate(recordTask, "RecordTask", 4096, NULL, 5, NULL);
-    xTaskCreate(sdWriteTask, "SDWriteTask", 8192, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(recordTask, "RecordTask", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(sdWriteTask, "SDWriteTask", 8192, NULL, 3, NULL, 1);
 
 
     // Audio Transcoding -------------------------
@@ -360,16 +368,7 @@ void setup() {
     jobQueue = xQueueCreate(5, sizeof(TranscodeJob));
 
     // Create the persistent FreeRTOS Task
-    xTaskCreatePinnedToCore(
-        transcodeTask,
-        "TranscodeTask",
-        16384,               // Ogg+Opus needs a hefty stack, bumped to 32k to be safe
-        NULL,
-        1,
-        &transcodeTaskHandle,
-        1                    // Pin to Core 1
-    );
-
+    xTaskCreatePinnedToCore(transcodeTask, "TranscodeTask", 16384, NULL, 1, &transcodeTaskHandle, 1);
 
     Serial.println("[SYSTEM] Ready. Waiting for Telegram messages...");
 }
@@ -443,14 +442,19 @@ void dialUp() {
 
     chat_index = (chat_index + 1) % max_chats;
     Serial.printf("[DIAL] Changed chat to index: %d \n", chat_index);
-    Serial.print("New Messages: "); 
+    /*Serial.print("New Messages: "); 
     for(int i = 0; i < 5; i++) {
       Serial.print(newMessages[i]);
-    }
+    }*/
     Serial.println("");
 }
 
+void setLED (bool state) {
+    if (state) {digitalWrite(LED_NOTIFICATION, HIGH);}
+    else digitalWrite(LED_NOTIFICATION, LOW);
 
+    state_LED = state;
+}
 
 
 
@@ -458,14 +462,19 @@ void dialUp() {
 
 // Plays a new message, either already on device or fetched. For the user, this acts like it goes online everytime
 void playNewMessage() {
-    if(isAudioRunning) return;
-    if(isRecording) return;
-    if (!battery.canFetch()) return;
+    if (isRecording) return;
+    if (isTranscoding) return;
+    if (isAudioRunning) return;
+
+    if (!fetchMessages()) {
+        Serial.println("[MESSAGE] No new messages :(");
+        return;
+    };
+    // New messages have been "fetched"
 
     int chatsWithNews = 0; // Will hold number of chats with new messages
 
-    // See if there already are chats that have unlistened messages in them
-    // If yes, pick a random one of them
+    // Pick a random chat with new messages
     if(hasChatsWithNews(&chatsWithNews)) {
         int chats_indices[max_chats]; // will hold the chatIndices of all chats containing unlistened messages
         int j = 0;
@@ -473,23 +482,20 @@ void playNewMessage() {
             if(newMessages[i]) chats_indices[j++] = i; // fill array
         }
         int randomChatIndex = millis() % chatsWithNews; // pick a random chat
-
         chat_index = randomChatIndex;
-
         playChat(chat_ids[chats_indices[randomChatIndex]], true); // play it back, transcode if necessary
+    } else {
+        Serial.println("[ERROR] Chats with new messages weren't found");
+        return;
     }
 
-    // If no, fetch telegram servers
-    else {
-        if(processTelegramUpdates()) playNewMessage(); // fetch and if new messages, try again
-        else Serial.println("[MESSAGE] No new messages :(");
-    }
-
-    battery.subtractUpdate();
+    setLED(false);
 }
 
 void playChatWrapper() {
     if (!battery.canListen()) return;
+
+    if (state_LED && newMessages[chat_index]) setLED(false); // if we manually selected the chat with new messages -> turn off light
     playChat(getChatId(), true);
     battery.subtractListen();
 }
@@ -497,6 +503,7 @@ void playChatWrapper() {
 // Play the last messages in a chat folder, transcode them if specified
 void playChat(const char* chatId, bool transcodeOgg) {
     if (isRecording) return;
+    if (isTranscoding) return;
     if (isAudioRunning) stopPlayback();
 
     char folderPath[24]; snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
@@ -539,23 +546,8 @@ void playChat(const char* chatId, bool transcodeOgg) {
     for (int i = 0; i < fileCount; i++) {
         const char* name = fileNames[i];  // "received_000.ogg"; "recorded_001.wav"
 
-        // If file should be transcoded before playing
-        if (transcodeOgg && strstr(name, ".ogg") != nullptr) {
-            // Prepare file paths
-            char oggPath[MAX_PATH_LEN];
-            snprintf(oggPath, sizeof(oggPath), "%s/%s", folderPath, name);
-            char wavPath[MAX_PATH_LEN];
-            convertExtension_ogg2wav(oggPath, wavPath);  // changes ".ogg" to ".wav"
-
-            // Queue transcode job
-            addTranscodeJob(oggPath, wavPath);  // add job to the queue
-
-            // Add to playback queue but wait for transcoding to finish
-            playbackQueue.pushAndWaitFor(wavPath, chatId);
-        }
-
         // If file is a wav
-        else if (strstr(name, ".wav") != nullptr) {
+        if (strstr(name, ".wav") != nullptr) {
             char filePath[MAX_PATH_LEN];
             snprintf(filePath, sizeof(filePath), "%s/%s", folderPath, name);
             playbackQueue.push(filePath);
@@ -686,14 +678,16 @@ void handleBehavior(unsigned long tp_now) {
     // Fetch every 11h no matter what, to make sure no messages get lost on telegrams servers (after 24h)
     if (timeSinceLastFetch > INTERVAL_AUTO_FETCH) {
         processTelegramUpdates();
-        //tp_lastFetch = tp_now;
+        tp_lastFetch = tp_now;
     }
 
-    // If there is battery, no new messages on device, last fetch more than 30mins ago, fetch automatically
-    else if (timeSinceLastFetch > 120000/*1800000 /*30min*/ && battery.level >= 80 && !hasChatsWithNews()) {
-        processTelegramUpdates();
-        battery.subtractUpdate();
-        //tp_lastFetch = tp_now;
+    // If no new messages indicated, every 30mins, if enough battery -> fake fetch a new message
+    else if (
+        !state_LED &&
+        timeSinceLastFetch > 1800000 /*30min*/ && 
+        battery.level >= 80
+    ){
+        fetchMessages();
     }
 }
 
@@ -705,12 +699,26 @@ void handleBehavior(unsigned long tp_now) {
 
 // RECEIVING 
 
+// "Fake" fetch: Pretend as if going online but only do so if no new messages are stored on device
+bool fetchMessages() {
+    if (!battery.canFetch()) return false;
+
+    bool ret = hasChatsWithNews();
+    if (!ret) ret = processTelegramUpdates();
+    if(ret) setLED(true); // turn on notification light
+
+    battery.subtractUpdate();
+    tp_lastFetch = millis();
+
+    return ret;
+}
+
 bool processTelegramUpdates() {
 
     bool ret = false;
 
     // ensure WiFi connection
-    if (!tryConnectWiFi(10000)) return false;
+    if (!tryConnectWiFi(15000)) return false;
 
     Serial.println("Telegram API: /getUpdates");
 
@@ -722,8 +730,6 @@ bool processTelegramUpdates() {
     int httpCode = http_getFile.GET();
     
     if (httpCode == HTTP_CODE_OK) {
-
-        tp_lastFetch = millis();
 
         WiFiClient* stream = http_getFile.getStreamPtr();
         JsonDocument doc_updates;
@@ -777,12 +783,19 @@ bool processTelegramUpdates() {
 
                     // Set up target OGG file path with incremented numbering
                     int fileIndex = getNextFileIndex(folderPath, "received_");
-                    char oggFilePath[64];
-                    snprintf(oggFilePath, sizeof(oggFilePath), "%s/received_%03d.ogg", folderPath, fileIndex);
+                    char oggPath[64];
+                    snprintf(oggPath, sizeof(oggPath), "%s/received_%03d.ogg", folderPath, fileIndex);
 
                     // Download Opus/OGG file
-                    if (downloadTelegramFile(fileId, oggFilePath)) {
+                    if (downloadTelegramFile(fileId, oggPath)) {
                         newMessages[chatIndex] = true; // signalize this chat has new, unlistened messages (in ogg format)
+
+                        char wavPath[MAX_PATH_LEN];
+                        convertExtension_ogg2wav(oggPath, wavPath);  // changes ".ogg" to ".wav"
+
+                        // Queue transcode job
+                        addTranscodeJob(oggPath, wavPath);  // add job to the transcode queue
+
                         ret = true;
                     }
                 }
@@ -802,6 +815,8 @@ bool processTelegramUpdates() {
         } else {
             Serial.printf("[ERROR] Parsing failed: %s\n", error.c_str());
         }
+    } else {
+        Serial.println("[ERROR] GET request failed");
     }
     http_getFile.end();
 
@@ -966,6 +981,8 @@ bool tryConnectWiFi(int timeout_ms) {
 // AUDIO PLAYBACK ==============================================
 
 void startPlayback(const char* filePath) {
+    if (isRecording) return;
+    if (isTranscoding) return;
     if (isAudioRunning) stopPlayback();
     
     audioFile = SD.open(filePath);
@@ -975,8 +992,8 @@ void startPlayback(const char* filePath) {
         return;
     }
 
-    // Prepare output stream for new file (resets decoder state)
-    stream_wavToI2s.begin();
+    setI2SData_playback(); // reinstall i2s resources before every playback to avoid desyncing
+    stream_wavToI2s.begin(); // Prepare output stream for new file (resets decoder state)
     
     // Point copier to newly opened file and output stream
     copier_playback.begin(stream_wavToI2s, audioFile);
@@ -990,6 +1007,7 @@ void stopPlayback() {
     if (isAudioRunning) {
         isAudioRunning = false;
         stream_wavToI2s.end(); // Stop the decoder and stream cleanly
+        i2s_playback.end(); // uninstall i2s resources
         
         if (audioFile) audioFile.close();
 
@@ -1009,10 +1027,12 @@ void processAudio() {
 }
 
 void setI2SData_playback() {
+
     auto config = i2s_playback.defaultConfig(TX_MODE);
     config.pin_bck = I2S_BCLK;
     config.pin_ws = I2S_LRC;
     config.pin_data = I2S_DOUT;
+
     i2s_playback.begin(config);
 }
 
@@ -1026,6 +1046,9 @@ void setI2SData_playback() {
 void startRecording() {
     if (!battery.canSend()) return;
     if (isAudioRunning) stopPlayback();
+
+    setI2SData_recording(); // reinstall i2s resources before every recording to avoid desyncing
+    delay(200);
 
     isRecording = true;
 }
@@ -1171,6 +1194,8 @@ void finishRecording() {
             return;
         }
     }
+
+    i2s_record.end(); // uninstall i2s resources
     
     Serial.println("[ERROR] Sending failed.");
     battery.subtractSend();
@@ -1186,6 +1211,7 @@ void setI2SData_recording() {
     config.pin_bck = I2S_BCLK;
     config.pin_data = I2S_DIN;
     config.pin_data_rx = I2S_DIN;
+
     i2s_record.begin(config);
 }
 
@@ -1212,6 +1238,7 @@ void transcodeTask(void *pvParameters) {
         // Block indefinitely until a job is pushed to the queue.
         if (xQueueReceive(jobQueue, &job, portMAX_DELAY) == pdPASS) {
             Serial.printf("\n[Transcoder] Started: %s -> %s\n", job.inFile, job.outFile);
+            isTranscoding = true;
 
             audioFileIn = SD.open(job.inFile, FILE_READ);
             audioFileOut = SD.open(job.outFile, FILE_WRITE);
@@ -1273,6 +1300,8 @@ void transcodeTask(void *pvParameters) {
 
             // Tell playback queue transcoding is finished
             playbackQueue.signalizeFileReady(job.outFile);
+
+            isTranscoding = false;
 
             Serial.println("\n[Transcoder] Transcoding finished. Back to sleep.");
         }
