@@ -165,6 +165,14 @@ struct Battery {
             return true;
         } else {
             Serial.println("[BATTERY] Action not possible, need more sun :)1");
+
+            // LED blink to signalize system
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            delay(100);
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            delay(100);
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+
             return false;
         };
     }
@@ -174,6 +182,14 @@ struct Battery {
             return true;
         } else {
             Serial.println("[BATTERY] Action not possible, need more sun :)2");
+
+            // LED blink to signalize system
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            delay(100);
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            delay(100);
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+
             return false;
         };
     }
@@ -183,6 +199,14 @@ struct Battery {
             return true;
         } else {
             Serial.println("[BATTERY] Action not possible, need more sun :)3");
+
+            // LED blink to signalize system
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            delay(100);
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            delay(100);
+            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+
             return false;
         };
     }
@@ -308,7 +332,7 @@ StreamCopy copier_transcode(stream_WavToFileOut, stream_OggToFileIn, 16384);
 
 void setup() {
     Serial.begin(115200);
-    while (!Serial);
+    delay(2000);
 
     // Pins
     pinMode(BUTTON, INPUT_PULLUP);
@@ -370,7 +394,9 @@ void setup() {
     // Create the persistent FreeRTOS Task
     xTaskCreatePinnedToCore(transcodeTask, "TranscodeTask", 16384, NULL, 1, &transcodeTaskHandle, 1);
 
-    Serial.println("[SYSTEM] Ready. Waiting for Telegram messages...");
+    Serial.println("[SYSTEM] Ready.");
+
+    fetchMessages();
 }
 
 void loop() {
@@ -702,6 +728,11 @@ void handleBehavior(unsigned long tp_now) {
 // "Fake" fetch: Pretend as if going online but only do so if no new messages are stored on device
 bool fetchMessages() {
     if (!battery.canFetch()) return false;
+
+    // LED blink to signalize refresh happened
+    digitalWrite(LED_NOTIFICATION, HIGH); delay(300); digitalWrite(LED_NOTIFICATION, LOW);
+    delay(300);
+    digitalWrite(LED_NOTIFICATION, HIGH); delay(300); digitalWrite(LED_NOTIFICATION, LOW);
 
     bool ret = hasChatsWithNews();
     if (!ret) ret = processTelegramUpdates();
@@ -1050,6 +1081,9 @@ void startRecording() {
     setI2SData_recording(); // reinstall i2s resources before every recording to avoid desyncing
     delay(200);
 
+    // LED on
+    digitalWrite(LED_NOTIFICATION, HIGH);
+
     isRecording = true;
 }
 
@@ -1065,7 +1099,7 @@ void recordTask(void *pvParameters) {
                 
                 if (bytes_read > 0) {
                     size_t mono_size = 0;
-                    const float gain = 6.0f; // Adjust gain factor as needed (e.g., 1.5f for 50% increase)
+                    const float gain = 3.0f; // Adjust gain factor as needed (e.g., 1.5f for 50% increase)
                     for (size_t i = 0; i < bytes_read; i += 8) { 
                         // A 32-bit stereo frame is 8 bytes: left (4 bytes), right (4 bytes)
                         // Extract left channel as 32-bit signed integer (assuming little-endian)
@@ -1184,6 +1218,9 @@ void finishRecording() {
     if (!isRecording) return; // Button was released but recording couldn't even be started
 
     isRecording = false;
+
+    // LED off
+    digitalWrite(LED_NOTIFICATION, LOW);
 
     // Give a little time and send as soon as recording actually stopped
     unsigned long tp = millis();
