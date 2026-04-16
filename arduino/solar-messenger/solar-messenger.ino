@@ -8,6 +8,7 @@
 #include <driver/i2s_std.h>
 #include "AudioTools.h"
 #include "AudioTools/AudioCodecs/CodecOpusOgg.h"
+#include "esp_sleep.h"
 
 // Bot Token, Chat-IDs, WiFi credentials
 #include "../Shared/arduino_secrets.h"
@@ -17,13 +18,16 @@
 // Forward Declarations
 void playNewMessage();
 void startRecording();
-void finishRecording();
+void stopRecording();
+void doNothing();
+void dial_shortPressWrapper ();
 void dialUp();
 void setLED (bool state);
-void doNothing();
 void playChatWrapper();
 void playChat(const char* chatId, bool transcodeOgg);
 bool isValidChat(const char* chat_id, int* printIndex_optional = nullptr);
+void chargeBattery();
+void handleBehavior(unsigned long tp_now);
 bool downloadTelegramFile(const char* fileId, const char* destination);
 bool transcodeOggToWav(const char* oggPath, const char* wavPath);
 void cleanupChatFolder(const char* folderPath, const char* prefix);
@@ -38,6 +42,7 @@ int findChatId(const char* chatId);
 void convertExtension_ogg2wav(const char* oggStr, char* wavStr);
 int getNextFileIndex(const char* folderPath, const char* prefix);
 bool tryConnectWiFi(int timeout_ms);
+void disconnectWiFi();
 void stopPlayback();
 void processAudio();
 void setI2SData_playback();
@@ -48,6 +53,23 @@ void addTranscodeJob(const char* oggFile, const char* wavFile);
 void transcodeTask(void *pvParameters);
 
 // ==========================================================================================
+
+// POWER MANAGEMENT ============================
+
+RTC_DATA_ATTR int bootCount = 0;
+
+RTC_DATA_ATTR int battery_level = 50;
+RTC_DATA_ATTR unsigned long battery_tpLastRefresh = 0;
+#define INTERVAL_BATTERY_UPDATE 180000 // 3min
+
+RTC_DATA_ATTR unsigned long totalMillis = 0;
+
+RTC_DATA_ATTR unsigned long tp_lastFetch = 0;
+#define INTERVAL_AUTO_FETCH 39600000 // 11h
+
+unsigned long tp_lastInteraction_millis = 0;
+#define TIMER_AUTO_SLEEP 120000 // 2min
+
 
 // USER INTERFACE ==============================
 
@@ -72,8 +94,8 @@ struct Button {
   ButtonEvent onRelease;
 };
 
-Button button = {BUTTON, HIGH, 0, false, false, playNewMessage, startRecording, finishRecording};
-Button button_dial = {BUTTON_DIAL, HIGH, 0, false, false, dialUp, playChatWrapper, doNothing};
+Button button = {BUTTON, HIGH, 0, false, false, playNewMessage, startRecording, stopRecording};
+Button button_dial = {BUTTON_DIAL, HIGH, 0, false, false, dial_shortPressWrapper, playChatWrapper, doNothing};
 
 
 // CHAT & PLAYBACK CONTROL ===========================
@@ -147,21 +169,18 @@ bool newMessages[max_chats] = {false};
 // BATTERY & SYSTEM BEHAVIOR =========================
 
 struct Battery {
-    int level = 50;
 
     int cost_send = 30;
     int cost_update = 30;
     int cost_listen = 5;
 
-    unsigned long tp_lastRefresh;
-
     void chargeBy(int points) {
-        level += points;
-        if (level > 100) level = 100;
+        battery_level += points;
+        if (battery_level > 100) level = 100;
     }
 
     bool canSend() {
-        if (level >= cost_send) {
+        if (battery_level >= cost_send) {
             return true;
         } else {
             Serial.println("[BATTERY] Action not possible, need more sun :)1");
@@ -178,7 +197,7 @@ struct Battery {
     }
 
     bool canFetch() {
-        if (level >= cost_update) {
+        if (battery_level >= cost_update) {
             return true;
         } else {
             Serial.println("[BATTERY] Action not possible, need more sun :)2");
@@ -195,7 +214,7 @@ struct Battery {
     }
 
     bool canListen() {
-        if (level >= cost_listen) {
+        if (battery_level >= cost_listen) {
             return true;
         } else {
             Serial.println("[BATTERY] Action not possible, need more sun :)3");
@@ -212,23 +231,19 @@ struct Battery {
     }
 
     void subtractSend() {
-        level -= cost_send;
+        battery_level -= cost_send;
     }
 
     void subtractUpdate() {
-        level -= cost_update;
+        battery_level -= cost_update;
     }
 
     void subtractListen() {
-        level -= cost_listen;
+        battery_level -= cost_listen;
     }
 };
 
 Battery battery;
-#define INTERVAL_BATTERY_UPDATE 50000
-
-unsigned long tp_lastFetch = 0;
-#define INTERVAL_AUTO_FETCH 39600000 // 11h in ms
 
 
 // NETWORK COMMUNICATION =============================
@@ -327,12 +342,48 @@ StreamCopy copier_transcode(stream_WavToFileOut, stream_OggToFileIn, 16384);
 // =============================================================================================
 
 
-
 // SETUP & LOOP =======================
 
+// Wake up and figure out what to do
 void setup() {
     Serial.begin(115200);
     delay(2000);
+
+    bootCount++;
+    Serial.println("Boot: " + String(bootCount));
+
+    tp_lastInteraction_millis = millis();
+
+    wakeReason = esp_sleep_get_wakeup_cause();
+
+    switch (wakeReason) {
+        case ESP_SLEEP_WAKEUP_TIMER:
+        checkIn();
+        break;
+
+        case ESP_SLEEP_WAKEUP_GPIO:
+        setupOfflineUsageMode();
+        break;
+
+        default:
+        setupOfflineUsageMode();
+    }
+}
+
+// This runs every X minutes
+void checkIn() {
+    Serial.println("Running SENSING mode");
+
+    totalMillis += INTERVAL_BATTERY_UPDATE; // add the time you spent sleeping
+
+    chargeBattery(); // Charge battery according to conditions
+    handleBehavior(totalMillis); // Check if fetching should happen
+
+    goToSleep();
+}
+
+// This runs on user interaction
+void setupOfflineUsageMode() {
 
     // Pins
     pinMode(BUTTON, INPUT_PULLUP);
@@ -352,10 +403,6 @@ void setup() {
         while (1);
     }
     Serial.println("[OK] SD Card Initialized.");
-
-
-    // WiFi connection
-    tryConnectWiFi(30000);
 
     setI2SData_playback();
 
@@ -396,24 +443,36 @@ void setup() {
 
     Serial.println("[SYSTEM] Ready.");
 
-    fetchMessages();
+    //fetchMessages();
 }
 
+void goToSleep() {
+    // Set timers to wake up
+    esp_sleep_enable_timer_wakeup(3 * 60 * 1000000ULL); // 3 min
+    esp_sleep_enable_ext0_wakeup(BUTTON, 0);
+
+    totalMillis += millis(); // add the time you took for this execution cycle
+
+    // Go back to sleep
+    esp_deep_sleep_start();
+}
+
+// runs repeatedly during active usage
 void loop() {
     processAudio();
 
     handleButton(button, "button");
     handleButton(button_dial, "dial");
 
-    if(!isRecording && !isAudioRunning) {
-        unsigned long tp_now = millis();
-        handleBattery(tp_now);
-        handleBehavior(tp_now);
+    if(!isRecording && !isAudioRunning && !isTranscoding) {
+        handleBehavior(totalMillis + millis());
+        handleAutoSleep();
     }
 
     if(!isAudioRunning && playbackQueue.hasNext()) {
         static char filePlaying[MAX_PATH_LEN];
         playbackQueue.pop(filePlaying);
+        delay(800);
         startPlayback(filePlaying);
     }
 }
@@ -423,7 +482,6 @@ void loop() {
 // =============================================================================================
 
 // =============================================================================================
-
 
 
 // USER CONTROL ==============================
@@ -441,6 +499,8 @@ void handleButton(Button &btn, const char* name) {
 
   // Button Released (Rising edge)
   if (currentState == HIGH && btn.lastState == LOW) {
+    resetAutoSleep(); // Every interaction with the device resets autosleep
+
     if (!btn.isHolding) {
       Serial.printf("%s: Short Press\n", name);
       if (btn.onShortPress) btn.onShortPress();
@@ -462,6 +522,11 @@ void handleButton(Button &btn, const char* name) {
 }
 
 void doNothing() {} // Helper function to prevent crash if an event is unassigned
+
+void dial_shortPressWrapper () {
+    if (isAudioRunning) stopPlayback();
+    else dialUp();
+}
 
 void dialUp() { 
     if(isRecording) return;
@@ -688,13 +753,11 @@ bool isValidChat(const char* chat_id, int* printIndex_optional) {
 
 // BATTERY & SYSTEM BEHAVIOR ============================
 
-void handleBattery(unsigned long tp_now) {
-    if (tp_now - battery.tp_lastRefresh > INTERVAL_BATTERY_UPDATE && battery.level < 100) {
+void chargeBattery() {
+    if (battery_level < 100) {
 
         battery.chargeBy(10);
-        Serial.printf("Battery level: %d\n", battery.level);
-
-        battery.tp_lastRefresh = tp_now;
+        Serial.printf("Battery level: %d\n", battery_level);
     }
 }
 
@@ -707,17 +770,27 @@ void handleBehavior(unsigned long tp_now) {
         tp_lastFetch = tp_now;
     }
 
-    // If no new messages indicated, every 30mins, if enough battery -> fake fetch a new message
+    // Every hour, if no new messages indicated, if enough battery -> "fetch" a new message
     else if (
         !state_LED &&
-        timeSinceLastFetch > 1800000 /*30min*/ && 
-        battery.level >= 80
+        timeSinceLastFetch > 3600000 /*1h*/ && 
+        battery_level >= 70
     ){
         fetchMessages();
     }
 }
 
+void handleAutoSleep() {
+    unsigned long timeSinceLastInteraction = millis() - tp_lastInteraction_millis;
 
+    if (timeSinceLastInteraction > TIMER_AUTO_SLEEP) {
+        goToSleep();
+    }
+}
+
+void resetAutoSleep() {
+    tp_lastInteraction_millis = millis();
+}
 
 
 
@@ -739,7 +812,7 @@ bool fetchMessages() {
     if(ret) setLED(true); // turn on notification light
 
     battery.subtractUpdate();
-    tp_lastFetch = millis();
+    tp_lastFetch = totalMillis + millis();
 
     return ret;
 }
@@ -749,7 +822,7 @@ bool processTelegramUpdates() {
     bool ret = false;
 
     // ensure WiFi connection
-    if (!tryConnectWiFi(15000)) return false;
+    if (!tryConnectWiFi(30000)) return false;
 
     Serial.println("Telegram API: /getUpdates");
 
@@ -850,6 +923,7 @@ bool processTelegramUpdates() {
         Serial.println("[ERROR] GET request failed");
     }
     http_getFile.end();
+    disconnectWiFi();
 
     return ret;
 }
@@ -907,7 +981,7 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
 
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id) {
 
-    tryConnectWiFi(10000); // ensure WiFi connection
+    tryConnectWiFi(30000); // ensure WiFi connection
 
     File f = SD.open(filePath);
     if (!f) {
@@ -957,29 +1031,45 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
 
     client_upload.stop();
     Serial.printf("Senden beendet. %s\n", chat_id);
+
+    disconnectWiFi();
 }
 
-bool tryConnectWiFi(int timeout_ms) {
+bool tryConnectWiFi(int timeout_ms) {    
     if (WiFi.status() == WL_CONNECTED) {
         return true;
     }
 
+    WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("[SYSTEM] Connecting to WiFi");
     
     unsigned long startAttemptTime = millis();
+    bool led_blink = false;
     while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout_ms) {
-        delay(500);
         Serial.print(".");
+        led_blink = !led_blink;
+        digitalWrite(LED_NOTIFICATION, led_blink);
+
+        delay(500);
     }
 
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
+
+        // LED blink to signalize system
+        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
+        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
+        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
+        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
+        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
+        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+
         return false;
     }
     else {
         Serial.println("\n[OK] WiFi connected.");
-        
+        digitalWrite(LED_NOTIFICATION, LOW);
 
         // Time syncing
 
@@ -1003,6 +1093,12 @@ bool tryConnectWiFi(int timeout_ms) {
 
     client_wifi.setInsecure(); 
     return true;
+}
+
+void disconnectWiFi() {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("Disconnected WiFi");
 }
 
 
@@ -1043,17 +1139,20 @@ void stopPlayback() {
         if (audioFile) audioFile.close();
 
         Serial.println(" --> Done.");
+
+        resetAutoSleep();
     }
 }
 
+// keeps the data flow to speaker alive while audio is running
 void processAudio() {
-    if (!isAudioRunning) return;
-    
-    // Is file still open and has data left?
-    if (audioFile && audioFile.available()) {
-        copier_playback.copy(); // Copy next chunk of audio
-    } else {
-        stopPlayback(); 
+    if (isAudioRunning) {
+        // Is file still open and has data left?
+        if (audioFile && audioFile.available()) {
+            copier_playback.copy(); // Copy next chunk of audio
+        } else {
+            stopPlayback(); 
+        }
     }
 }
 
@@ -1214,8 +1313,10 @@ void sdWriteTask(void *pvParameters) {
 }
 
 // Tie things up after recording is done
-void finishRecording() {
+void stopRecording() {
     if (!isRecording) return; // Button was released but recording couldn't even be started
+
+    resetAutoSleep();
 
     isRecording = false;
 
@@ -1340,7 +1441,9 @@ void transcodeTask(void *pvParameters) {
 
             isTranscoding = false;
 
-            Serial.println("\n[Transcoder] Transcoding finished. Back to sleep.");
+            Serial.println("\n[Transcoder] Transcoding finished.");
+
+            resetAutoSleep();
         }
     }
 }
