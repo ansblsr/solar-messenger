@@ -9,6 +9,7 @@
 #include "AudioTools.h"
 #include "AudioTools/AudioCodecs/CodecOpusOgg.h"
 #include "esp_sleep.h"
+#include "driver/rtc_io.h"
 
 // Bot Token, Chat-IDs, WiFi credentials
 #include "../Shared/arduino_secrets.h"
@@ -24,12 +25,11 @@ void dial_shortPressWrapper ();
 void dialUp();
 void setLED (bool state);
 void playChatWrapper();
-void playChat(const char* chatId, bool transcodeOgg);
+void playChat(const char* chatId);
 bool isValidChat(const char* chat_id, int* printIndex_optional = nullptr);
 void chargeBattery();
 void handleBehavior(unsigned long tp_now);
 bool downloadTelegramFile(const char* fileId, const char* destination);
-bool transcodeOggToWav(const char* oggPath, const char* wavPath);
 void cleanupChatFolder(const char* folderPath, const char* prefix);
 bool hasChatsWithNews(int* printNumber_optional = nullptr);
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id);
@@ -58,9 +58,8 @@ void transcodeTask(void *pvParameters);
 
 RTC_DATA_ATTR int bootCount = 0;
 
-RTC_DATA_ATTR int battery_level = 50;
 RTC_DATA_ATTR unsigned long battery_tpLastRefresh = 0;
-#define INTERVAL_BATTERY_UPDATE 180000 // 3min
+#define INTERVAL_BATTERY_UPDATE_US 30000000//180000000 // 3min
 
 RTC_DATA_ATTR unsigned long totalMillis = 0;
 
@@ -68,7 +67,7 @@ RTC_DATA_ATTR unsigned long tp_lastFetch = 0;
 #define INTERVAL_AUTO_FETCH 39600000 // 11h
 
 unsigned long tp_lastInteraction_millis = 0;
-#define TIMER_AUTO_SLEEP 120000 // 2min
+#define TIMER_AUTO_SLEEP 30000//120000 // 2min
 
 
 // USER INTERFACE ==============================
@@ -77,7 +76,7 @@ unsigned long tp_lastInteraction_millis = 0;
 #define BUTTON_DIAL A4
 
 #define LED_NOTIFICATION A3
-bool state_LED = false;
+RTC_DATA_ATTR bool state_LED = false;
 
 const unsigned long SHORT_PRESS_TIME = 500; // Threshold for long press
 
@@ -108,8 +107,6 @@ struct PlaybackQueue {
     int head = 0; // Where we add new items
     int tail = 0; // Where we read items
     int count = 0; // Current number of items
-    int waitCount = 0; // how many files are we waiting on?
-    char waitingOnChatId [12] = "";
 
     bool push(const char* path) {
         if (count >= QUEUE_SIZE) return false; // Queue full
@@ -133,40 +130,23 @@ struct PlaybackQueue {
         head = 0;
         tail = 0;
         count = 0;
-
-        waitCount = 0;
-        snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", "");
     }
 
     bool hasNext() {
-        if(count > 0 && waitCount == 0) return true;
+        if(count > 0) return true;
         return false;
-    }
-
-    bool pushAndWaitFor(const char* path, const char* chatId) {
-        if(waitCount > 0 && strcmp(waitingOnChatId, chatId) != 0) return false; // If already waiting and this chatId isn't already waited for
-
-        if(push(path)) {
-            snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", chatId);
-            waitCount++;
-            return true;
-        }
-        return false;
-    }
-
-    void signalizeFileReady(const char* wavPath) {
-        if (strstr(wavPath, waitingOnChatId) != nullptr) waitCount--; // If we waited for this chat
-        if (waitCount == 0) snprintf(waitingOnChatId, sizeof(waitingOnChatId), "%s", ""); // If everything is here, forget chatId
     }
 };
 
 PlaybackQueue playbackQueue;
 
 int chat_index = 0;
-bool newMessages[max_chats] = {false};
+RTC_DATA_ATTR bool newMessages[max_chats] = {false};
 
 
 // BATTERY & SYSTEM BEHAVIOR =========================
+
+RTC_DATA_ATTR int battery_level = 100;
 
 struct Battery {
 
@@ -176,7 +156,7 @@ struct Battery {
 
     void chargeBy(int points) {
         battery_level += points;
-        if (battery_level > 100) level = 100;
+        if (battery_level > 100) battery_level = 100;
     }
 
     bool canSend() {
@@ -250,8 +230,10 @@ Battery battery;
 
 WiFiClientSecure client_wifi;
 
-long lastUpdateId = 0;
+RTC_DATA_ATTR long lastUpdateId = 0;
 i2s_chan_handle_t rx_handle = NULL;
+
+bool isDownloading = false;
 
 
 // INTERNAL COMMUNICATION =======================
@@ -312,6 +294,7 @@ QueueHandle_t fullQueue;
 // file.ogg --> OpusOggDecoder --StreamCopy--> WavEncoder --> File.wav
 
 bool isTranscoding = false;
+bool transcoderInitialized = false;
 
 // Struct to pass jobs to the FreeRTOS task
 struct TranscodeJob {
@@ -320,6 +303,7 @@ struct TranscodeJob {
 };
 
 // Transcoding Queue
+SemaphoreHandle_t startTranscodeGate;
 QueueHandle_t jobQueue;
 TaskHandle_t transcodeTaskHandle = NULL;
 
@@ -347,67 +331,74 @@ StreamCopy copier_transcode(stream_WavToFileOut, stream_OggToFileIn, 16384);
 // Wake up and figure out what to do
 void setup() {
     Serial.begin(115200);
-    delay(2000);
+
+    // Wait for up to 5 seconds for the serial
+    unsigned long start = millis();
+    while (!Serial && millis() - start < 5000) {
+        delay(10);
+    }
 
     bootCount++;
-    Serial.println("Boot: " + String(bootCount));
+    Serial.printf(" Just woke up. Boot count: %d\n", bootCount);
 
-    tp_lastInteraction_millis = millis();
+    resetAutoSleep();
 
-    wakeReason = esp_sleep_get_wakeup_cause();
+    esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
 
     switch (wakeReason) {
         case ESP_SLEEP_WAKEUP_TIMER:
-        checkIn();
+        setupSensingMode();
         break;
 
         case ESP_SLEEP_WAKEUP_GPIO:
-        setupOfflineUsageMode();
+        setupUsageMode();
         break;
 
         default:
-        setupOfflineUsageMode();
+        setupUsageMode();
     }
 }
 
 // This runs every X minutes
-void checkIn() {
-    Serial.println("Running SENSING mode");
+void setupSensingMode() {
+    Serial.println("Running sensing mode...");
 
-    totalMillis += INTERVAL_BATTERY_UPDATE; // add the time you spent sleeping
+    totalMillis += INTERVAL_BATTERY_UPDATE_US / 1000; // add the time you spent sleeping
 
     chargeBattery(); // Charge battery according to conditions
     handleBehavior(totalMillis); // Check if fetching should happen
+
+    // Wait for any transcoding to complete before sleeping
+    while (isTranscoding) {
+        delay(100);
+    }
+
+    delay(300);
 
     goToSleep();
 }
 
 // This runs on user interaction
-void setupOfflineUsageMode() {
+void setupUsageMode() {
+    Serial.println("Running usage mode...");
 
     // Pins
     pinMode(BUTTON, INPUT_PULLUP);
     pinMode(BUTTON_DIAL, INPUT_PULLUP);
 
     pinMode(LED_NOTIFICATION, OUTPUT);
-    digitalWrite(LED_NOTIFICATION, LOW);
 
     //AudioLogger::instance().begin(Serial, AudioLogger::Debug);
 
     Serial.println("\n[SYSTEM] Initializing...");
-    
 
-    // SD card mount -----------------------------
-    if (!SD.begin(SD_CS)) {
-        Serial.println("[CRITICAL] SD Card Mount Failed!");
-        while (1);
-    }
-    Serial.println("[OK] SD Card Initialized.");
+    initSDCard();
 
     setI2SData_playback();
 
+    digitalWrite(LED_NOTIFICATION, state_LED);
 
-    // Audio Recording -----------------------
+    // Initialize Audio Recording -----------------------
 
     emptyQueue = xQueueCreate(NUM_CHUNKS, sizeof(AudioBuffer*));
     fullQueue = xQueueCreate(NUM_CHUNKS, sizeof(AudioBuffer*));
@@ -426,6 +417,19 @@ void setupOfflineUsageMode() {
 
 
     // Audio Transcoding -------------------------
+    initTranscoder();
+
+    Serial.println("[SYSTEM] Ready.");
+
+    //fetchMessages();
+}
+
+void initTranscoder() {
+    if(transcoderInitialized) return;
+    
+    // Initialize transcoding system for potential message processing
+    // Create the gate (binary semaphore starts "taken")
+    startTranscodeGate = xSemaphoreCreateBinary();
 
     AudioInfo info_transcoding;
     info_transcoding.sample_rate = 48000;
@@ -441,17 +445,26 @@ void setupOfflineUsageMode() {
     // Create the persistent FreeRTOS Task
     xTaskCreatePinnedToCore(transcodeTask, "TranscodeTask", 16384, NULL, 1, &transcodeTaskHandle, 1);
 
-    Serial.println("[SYSTEM] Ready.");
-
-    //fetchMessages();
+    transcoderInitialized = true;
 }
 
 void goToSleep() {
+
+    digitalWrite(LED_NOTIFICATION, LOW);
+
+    disconnectWiFi();
+
     // Set timers to wake up
-    esp_sleep_enable_timer_wakeup(3 * 60 * 1000000ULL); // 3 min
-    esp_sleep_enable_ext0_wakeup(BUTTON, 0);
+    esp_sleep_enable_timer_wakeup(INTERVAL_BATTERY_UPDATE_US); // 3 min
+
+    // Set buttons to wake up
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_11, 0); // Wake on LOW
+    rtc_gpio_pullup_en(GPIO_NUM_11);
+    rtc_gpio_pulldown_dis(GPIO_NUM_11);
 
     totalMillis += millis(); // add the time you took for this execution cycle
+
+    Serial.println("Going back to sleep...");
 
     // Go back to sleep
     esp_deep_sleep_start();
@@ -533,10 +546,10 @@ void dialUp() {
 
     chat_index = (chat_index + 1) % max_chats;
     Serial.printf("[DIAL] Changed chat to index: %d \n", chat_index);
-    /*Serial.print("New Messages: "); 
+    Serial.print("New Messages: "); 
     for(int i = 0; i < 5; i++) {
       Serial.print(newMessages[i]);
-    }*/
+    }
     Serial.println("");
 }
 
@@ -561,6 +574,9 @@ void playNewMessage() {
         Serial.println("[MESSAGE] No new messages :(");
         return;
     };
+
+    while (isTranscoding) {}
+    
     // New messages have been "fetched"
 
     int chatsWithNews = 0; // Will hold number of chats with new messages
@@ -572,9 +588,9 @@ void playNewMessage() {
         for(int i = 0; i < max_chats; i++) {
             if(newMessages[i]) chats_indices[j++] = i; // fill array
         }
-        int randomChatIndex = millis() % chatsWithNews; // pick a random chat
+        int randomChatIndex = (totalMillis + millis()) % chatsWithNews; // pick a random chat
         chat_index = randomChatIndex;
-        playChat(chat_ids[chats_indices[randomChatIndex]], true); // play it back, transcode if necessary
+        playChat(chat_ids[chats_indices[randomChatIndex]]); // play it back
     } else {
         Serial.println("[ERROR] Chats with new messages weren't found");
         return;
@@ -587,12 +603,12 @@ void playChatWrapper() {
     if (!battery.canListen()) return;
 
     if (state_LED && newMessages[chat_index]) setLED(false); // if we manually selected the chat with new messages -> turn off light
-    playChat(getChatId(), true);
+    playChat(getChatId());
     battery.subtractListen();
 }
 
 // Play the last messages in a chat folder, transcode them if specified
-void playChat(const char* chatId, bool transcodeOgg) {
+void playChat(const char* chatId) {
     if (isRecording) return;
     if (isTranscoding) return;
     if (isAudioRunning) stopPlayback();
@@ -651,13 +667,15 @@ void playChat(const char* chatId, bool transcodeOgg) {
 void convertExtension_ogg2wav(const char* oggStr, char* wavStr) {
     if (!oggStr || !wavStr) return;
 
-    // Copy source to destination safely
-    strcpy(wavStr, oggStr);
+    // Copy source to destination safely with bounds checking
+    strncpy(wavStr, oggStr, MAX_PATH_LEN - 1);
+    wavStr[MAX_PATH_LEN - 1] = '\0';
 
     size_t len = strlen(wavStr);
     if (len >= 4) {
-        // Just overwrite the end of the existing buffer
-        strcpy(wavStr + len - 4, ".wav");
+        // Replace extension with .wav
+        strncpy(wavStr + len - 4, ".wav", 4);
+        wavStr[len] = '\0';
     }
 }
 
@@ -766,6 +784,7 @@ void handleBehavior(unsigned long tp_now) {
 
     // Fetch every 11h no matter what, to make sure no messages get lost on telegrams servers (after 24h)
     if (timeSinceLastFetch > INTERVAL_AUTO_FETCH) {
+        initTranscoder();
         processTelegramUpdates();
         tp_lastFetch = tp_now;
     }
@@ -773,8 +792,8 @@ void handleBehavior(unsigned long tp_now) {
     // Every hour, if no new messages indicated, if enough battery -> "fetch" a new message
     else if (
         !state_LED &&
-        timeSinceLastFetch > 3600000 /*1h*/ && 
-        battery_level >= 70
+        timeSinceLastFetch > 60000/*3600000 /*1h*/ && 
+        battery_level >= 60
     ){
         fetchMessages();
     }
@@ -802,13 +821,14 @@ void resetAutoSleep() {
 bool fetchMessages() {
     if (!battery.canFetch()) return false;
 
-    // LED blink to signalize refresh happened
-    digitalWrite(LED_NOTIFICATION, HIGH); delay(300); digitalWrite(LED_NOTIFICATION, LOW);
-    delay(300);
-    digitalWrite(LED_NOTIFICATION, HIGH); delay(300); digitalWrite(LED_NOTIFICATION, LOW);
+    Serial.println("Fetching messages...");
 
-    bool ret = hasChatsWithNews();
-    if (!ret) ret = processTelegramUpdates();
+    bool ret = state_LED; // is there already a new message signalized?
+    if (!ret) ret = hasChatsWithNews(); // is there already a new message on the device?
+    if (!ret) {
+        initTranscoder();
+        ret = processTelegramUpdates(); // are there new messages online?
+    }
     if(ret) setLED(true); // turn on notification light
 
     battery.subtractUpdate();
@@ -890,18 +910,32 @@ bool processTelegramUpdates() {
                     char oggPath[64];
                     snprintf(oggPath, sizeof(oggPath), "%s/received_%03d.ogg", folderPath, fileIndex);
 
+                    isDownloading = true;
+
                     // Download Opus/OGG file
                     if (downloadTelegramFile(fileId, oggPath)) {
-                        newMessages[chatIndex] = true; // signalize this chat has new, unlistened messages (in ogg format)
+                        newMessages[chatIndex] = true; // remember this chat has new, unlistened messages
+
+                        Serial.println("here0");
 
                         char wavPath[MAX_PATH_LEN];
                         convertExtension_ogg2wav(oggPath, wavPath);  // changes ".ogg" to ".wav"
 
+                        Serial.println("here1");
+
+                        // Yield to watchdog before queuing
+                        vTaskDelay(pdMS_TO_TICKS(1));
+
                         // Queue transcode job
                         addTranscodeJob(oggPath, wavPath);  // add job to the transcode queue
 
+                        Serial.println("here2");
+
                         ret = true;
                     }
+
+                    // Yield to watchdog between files
+                    vTaskDelay(pdMS_TO_TICKS(1));
                 }
 
                 // Text Message?
@@ -923,13 +957,22 @@ bool processTelegramUpdates() {
         Serial.println("[ERROR] GET request failed");
     }
     http_getFile.end();
+    delay(500);
     disconnectWiFi();
+
+    // allow transcoder task to start after all downloads are finished
+    isDownloading = false;
+    xSemaphoreGive(startTranscodeGate);
 
     return ret;
 }
 
 // Downloads audio file from Telegram Servers
 bool downloadTelegramFile(const char* fileId, const char* destination) {
+
+    // ensure SD card initialized
+    if (!initSDCard()) return false;
+
     Serial.println("Telegram API: /getFile");
     
     char getFile_url[256];
@@ -965,7 +1008,7 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
                     http_download.end();
                     http_getFile.end();
                     return true;
-            }
+                }
             }
             http_download.end();
         }
@@ -976,6 +1019,14 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
     return false;
 }
 
+bool initSDCard() {
+    if (!SD.begin(SD_CS)) {
+        Serial.println("[CRITICAL] SD Card Mount Failed!");
+        return false;
+    }
+    Serial.println("[OK] SD Card Initialized.");
+    return true;
+}
 
 // SENDING
 
@@ -1032,6 +1083,7 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
     client_upload.stop();
     Serial.printf("Senden beendet. %s\n", chat_id);
 
+    delay(500);
     disconnectWiFi();
 }
 
@@ -1096,9 +1148,11 @@ bool tryConnectWiFi(int timeout_ms) {
 }
 
 void disconnectWiFi() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    Serial.println("Disconnected WiFi");
+    Serial.println("Disconnected WiFi\n");
 }
 
 
@@ -1360,21 +1414,30 @@ void setI2SData_recording() {
 // AUDIO TRANSCODING ==========================================
 
 void addTranscodeJob(const char* oggFile, const char* wavFile) {
+    Serial.println("addTranscodeJob");
+    isTranscoding = true;
     TranscodeJob newJob;
     strncpy(newJob.inFile, oggFile, sizeof(newJob.inFile));
     strncpy(newJob.outFile, wavFile, sizeof(newJob.outFile));
-    xQueueSend(jobQueue, &newJob, portMAX_DELAY);
+    if (xQueueSend(jobQueue, &newJob, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        Serial.println("[ERROR] Failed to queue transcode job - queue full or timeout");
+        isTranscoding = false;
+    }
 }
 
 // Transcode OGG/Opus file into Wav File
 void transcodeTask(void *pvParameters) {
-    Serial.println("Transcoder task initialized. Sleeping until a job arrives...");
 
     TranscodeJob job;
     
     while (true) {
-        // Block indefinitely until a job is pushed to the queue.
-        if (xQueueReceive(jobQueue, &job, portMAX_DELAY) == pdPASS) {
+
+        // Block until the current download batch is complete.
+        xSemaphoreTake(startTranscodeGate, portMAX_DELAY);
+
+        // Process all jobs that were enqueued during the batch.
+        while (xQueueReceive(jobQueue, &job, 0) == pdPASS) {
+
             Serial.printf("\n[Transcoder] Started: %s -> %s\n", job.inFile, job.outFile);
             isTranscoding = true;
 
@@ -1435,9 +1498,6 @@ void transcodeTask(void *pvParameters) {
 
             // Remove transcoded ogg file from card
             SD.remove(job.inFile);
-
-            // Tell playback queue transcoding is finished
-            playbackQueue.signalizeFileReady(job.outFile);
 
             isTranscoding = false;
 
