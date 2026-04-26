@@ -866,6 +866,9 @@ bool processTelegramUpdates() {
                 Serial.println("[OK] No new messages found");
             }
 
+            // ensure SD card initialized
+            if (!initSDCard()) return false; // trying it here to maybe fix ordering bug...
+
             // For every new message
             for (JsonObject currentResult : results) {
 
@@ -916,20 +919,14 @@ bool processTelegramUpdates() {
                     if (downloadTelegramFile(fileId, oggPath)) {
                         newMessages[chatIndex] = true; // remember this chat has new, unlistened messages
 
-                        Serial.println("here0");
-
                         char wavPath[MAX_PATH_LEN];
                         convertExtension_ogg2wav(oggPath, wavPath);  // changes ".ogg" to ".wav"
-
-                        Serial.println("here1");
 
                         // Yield to watchdog before queuing
                         vTaskDelay(pdMS_TO_TICKS(1));
 
                         // Queue transcode job
                         addTranscodeJob(oggPath, wavPath);  // add job to the transcode queue
-
-                        Serial.println("here2");
 
                         ret = true;
                     }
@@ -1414,7 +1411,6 @@ void setI2SData_recording() {
 // AUDIO TRANSCODING ==========================================
 
 void addTranscodeJob(const char* oggFile, const char* wavFile) {
-    Serial.println("addTranscodeJob");
     isTranscoding = true;
     TranscodeJob newJob;
     strncpy(newJob.inFile, oggFile, sizeof(newJob.inFile));
