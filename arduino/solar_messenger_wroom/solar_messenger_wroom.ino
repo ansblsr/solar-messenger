@@ -50,6 +50,7 @@ void sdWriteTask(void *pvParameters);
 void setI2SData_recording();
 void addTranscodeJob(const char* oggFile, const char* wavFile);
 void transcodeTask(void *pvParameters);
+void blinkLED(int times, int delay_ms);
 
 // ==========================================================================================
 
@@ -133,7 +134,7 @@ const int8_t encTable[16] = {
 
 #define LED_PIN     13
 #define NUM_LEDS    15
-#define BRIGHTNESS  50
+#define BRIGHTNESS  20
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
 
@@ -191,17 +192,17 @@ RTC_DATA_ATTR bool newMessages[max_chats] = {false};
 
 // BATTERY & SYSTEM BEHAVIOR =========================
 
-RTC_DATA_ATTR int battery_level = 100;
+RTC_DATA_ATTR int battery_level = 500;
 
 struct Battery {
 
-    int cost_send = 30;
-    int cost_update = 30;
-    int cost_listen = 5;
+    int cost_send = 300;
+    int cost_update = 300;
+    int cost_listen = 50;
 
     void chargeBy(int points) {
         battery_level += points;
-        if (battery_level > 100) battery_level = 100;
+        if (battery_level > 1000) battery_level = 1000;
     }
 
     bool canSend() {
@@ -211,11 +212,7 @@ struct Battery {
             Serial.println("[BATTERY] Action not possible, need more sun :)1");
 
             // LED blink to signalize system
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
-            delay(100);
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
-            delay(100);
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            blinkLED(3, 100);
 
             return false;
         };
@@ -228,11 +225,7 @@ struct Battery {
             Serial.println("[BATTERY] Action not possible, need more sun :)2");
 
             // LED blink to signalize system
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
-            delay(100);
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
-            delay(100);
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            blinkLED(3, 100);
 
             return false;
         };
@@ -245,11 +238,7 @@ struct Battery {
             Serial.println("[BATTERY] Action not possible, need more sun :)3");
 
             // LED blink to signalize system
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
-            delay(100);
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
-            delay(100);
-            digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+            blinkLED(3, 100);
 
             return false;
         };
@@ -269,6 +258,8 @@ struct Battery {
 };
 
 Battery battery;
+
+#define LRD_PIN 1
 
 
 // NETWORK COMMUNICATION =============================
@@ -411,6 +402,8 @@ void setup() {
 void setupSensingMode() {
     Serial.println("Running sensing mode...");
 
+    analogSetAttenuation(ADC_11db);
+
     totalMillis += INTERVAL_BATTERY_UPDATE_US / 1000; // add the time you spent sleeping
 
     chargeBattery(); // Charge battery according to conditions
@@ -503,7 +496,6 @@ void loop() {
     handleButton(button, "button");
 
     handleDial();
-
     handleLEDStrip();
 
     if (wasDialMoved()) {
@@ -608,10 +600,13 @@ void handleDial() {
 
   int newDial = (raw / 4) % max_chats; // 4 steps per click
 
+  if (newDial < 0) newDial += max_chats;
+
   if (newDial != lastDialPosition) {
     dialPosition = newDial;
     lastDialPosition = newDial;
     dialMovedFlag = true;
+    Serial.println("Dial pos set to: "); Serial.println(newDial);
   }
 
   // Handle button ----
@@ -653,7 +648,7 @@ bool wasButtonPressed() {
 void selectChat(int pos) {
     if(isRecording) return;
 
-    chat_index = pos;
+    chat_index = constrain(pos, 0, max_chats);
 
     Serial.printf("[DIAL] Changed chat to index: %d \n", chat_index);
     Serial.print("New Messages: "); 
@@ -672,6 +667,17 @@ void setLED (bool state) {
     state_LED = state;
 }
 
+void blinkLED(int times, int delay_ms) {
+    digitalWrite(LED_NOTIFICATION, LOW);
+
+    for(int i = 0; i < times; i++) {
+        digitalWrite(LED_NOTIFICATION, HIGH);
+        delay(delay_ms);
+        digitalWrite(LED_NOTIFICATION, LOW);
+        delay(delay_ms);
+    }
+}
+
 // LED strip ---------------------
 
 void initLEDRing() {
@@ -680,7 +686,7 @@ void initLEDRing() {
     FastLED.setBrightness(BRIGHTNESS);
   
     // Set initial state
-    showBatteryLevelLED(4000);
+    showBatteryLevelLED(3000);
 }
 
 /** Updates the strip based on a single integer position.**/
@@ -696,19 +702,22 @@ void showDialPositionLED(int pos) {
 }
 
 void handleLEDStrip() {
-    if (showingBatteryLevel && tp_showBatteryLevelUntil - millis() < 0) {
+    
+    if (showingBatteryLevel && millis() >= tp_showBatteryLevelUntil) {
         showDialPositionLED(dialPosition);
+        Serial.println("Shut off leds");
+        showingBatteryLevel = false;
     }
 }
 
 void showBatteryLevelLED(int duration_ms) {
     FastLED.clear();
 
-    int batteryLevel = constrain(battery_level, 0, 100); // Stay in range to be sure
-    int ledsLit = NUM_LEDS * (batteryLevel / 100);
+    int batteryLevel = constrain(battery_level, 0, 1000); // Stay in range to be sure
+    int ledsLit = (NUM_LEDS * batteryLevel) / 1000;
 
     // Fill from index 0 up to ledsLit with green
-    for (int i = 0; i < ledsLit && i < NUM_LEDS; i++) {
+    for (int i = 0; i < ledsLit; i++) {
         leds[i] = CRGB::Green;
     }
 
@@ -939,11 +948,36 @@ bool isValidChat(const char* chat_id, int* printIndex_optional) {
 // BATTERY & SYSTEM BEHAVIOR ============================
 
 void chargeBattery() {
-    if (battery_level < 100) {
+    if (battery_level < 1000) {
 
-        battery.chargeBy(10);
+        int brightness = measureBrightness();
+
+        int chargeAmount = 0;
+
+        if      (brightness < 300) chargeAmount = 0;
+        else if (brightness < 600) chargeAmount = 1; // Dim indoors (50h)
+        else if (brightness < 3000) chargeAmount = 4; // Lit indoors (12,5h)
+        else if (brightness < 3500) chargeAmount = 8; // Outdoors, brighter than brightest indoors (6,25h)
+        else chargeAmount = 16; // Bright outdoors (3,125h until full)
+
+        battery.chargeBy(chargeAmount);
         Serial.printf("Battery level: %d\n", battery_level);
     }
+}
+
+int measureBrightness() {
+    int sum = 0;
+    int samples = 64;
+  
+    // Average multiple readings to eliminate noise
+    for(int i = 0; i < samples; i++) {
+        sum += analogRead(LRD_PIN);
+        delay(1); 
+    }
+    
+    int averageValue = sum / samples;
+
+    return averageValue;
 }
 
 void handleBehavior(unsigned long tp_now) {
@@ -959,8 +993,8 @@ void handleBehavior(unsigned long tp_now) {
     // Every hour, if no new messages indicated, if enough battery -> "fetch" a new message
     else if (
         !state_LED &&
-        timeSinceLastFetch > 60000/*3600000 /*1h*/ && 
-        battery_level >= 60
+        timeSinceLastFetch > 3600000 /*1h*/ && 
+        battery_level >= 600
     ){
         fetchMessages();
     }
@@ -1272,8 +1306,8 @@ bool tryConnectWiFi(int timeout_ms) {
     bool led_blink = false;
     while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout_ms) {
         Serial.print(".");
-        led_blink = !led_blink;
-        digitalWrite(LED_NOTIFICATION, led_blink);
+        //led_blink = !led_blink;
+        //digitalWrite(LED_NOTIFICATION, led_blink);
 
         delay(500);
     }
@@ -1282,12 +1316,7 @@ bool tryConnectWiFi(int timeout_ms) {
         Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
 
         // LED blink to signalize system
-        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
-        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
-        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
-        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
-        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW); delay(100);
-        digitalWrite(LED_NOTIFICATION, HIGH); delay(100); digitalWrite(LED_NOTIFICATION, LOW);
+        blinkLED(7, 100);
 
         return false;
     }
