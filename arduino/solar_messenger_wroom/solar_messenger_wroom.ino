@@ -58,7 +58,7 @@ void transcodeTask(void *pvParameters);
 RTC_DATA_ATTR int bootCount = 0;
 
 RTC_DATA_ATTR unsigned long battery_tpLastRefresh = 0;
-#define INTERVAL_BATTERY_UPDATE_US 30000000//180000000 // 3min
+#define INTERVAL_BATTERY_UPDATE_US 180000000 // 3min
 
 RTC_DATA_ATTR unsigned long totalMillis = 0;
 
@@ -132,12 +132,14 @@ const int8_t encTable[16] = {
 
 #define LED_PIN     13
 #define NUM_LEDS    15
-#define BRIGHTNESS  64
+#define BRIGHTNESS  50
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
 
 CRGB leds[NUM_LEDS];
 
+bool showingBatteryLevel = false;
+unsigned long tp_showBatteryLevelUntil = 0;
 
 // CHAT & PLAYBACK CONTROL ===========================
 
@@ -469,30 +471,6 @@ void setupUsageMode() {
     //fetchMessages();
 }
 
-void initTranscoder() {
-    if(transcoderInitialized) return;
-    
-    // Initialize transcoding system for potential message processing
-    // Create the gate (binary semaphore starts "taken")
-    startTranscodeGate = xSemaphoreCreateBinary();
-
-    AudioInfo info_transcoding;
-    info_transcoding.sample_rate = 48000;
-    info_transcoding.channels = 1;
-    info_transcoding.bits_per_sample = 16;
-
-    decoder_opusOgg.setAudioInfo(info_transcoding);
-    encoder_wav.setAudioInfo(info_transcoding);
-
-    // Create a queue capable of holding up to 5 pending transcode jobs
-    jobQueue = xQueueCreate(5, sizeof(TranscodeJob));
-
-    // Create the persistent FreeRTOS Task
-    xTaskCreatePinnedToCore(transcodeTask, "TranscodeTask", 16384, NULL, 1, &transcodeTaskHandle, 1);
-
-    transcoderInitialized = true;
-}
-
 void goToSleep() {
 
     digitalWrite(LED_NOTIFICATION, LOW);
@@ -525,6 +503,8 @@ void loop() {
     handleButton(button, "button");
 
     handleDial();
+
+    handleLEDStrip();
 
     if (wasDialMoved()) {
         selectChat(dialPosition);
@@ -607,7 +587,6 @@ void IRAM_ATTR handleEncoderISR() {
   lastState = state;
 }
 
-// ================= INIT =================
 void initDial() {
   pinMode(CLK, INPUT_PULLUP);
   pinMode(DT, INPUT_PULLUP);
@@ -619,9 +598,8 @@ void initDial() {
   attachInterrupt(digitalPinToInterrupt(DT), handleEncoderISR, CHANGE);
 }
 
-// ================= MAIN HANDLER =================
 void handleDial() {
-  // ---- Handle rotation ----
+  // Handle rotation ----
   noInterrupts();
   int raw = rawEncoder;
   interrupts();
@@ -634,7 +612,7 @@ void handleDial() {
     dialMovedFlag = true;
   }
 
-  // ---- Handle button ----
+  // Handle button ----
   int reading = digitalRead(SW);
 
   if (reading != lastButtonState) {
@@ -653,8 +631,6 @@ void handleDial() {
 
   lastButtonState = reading;
 }
-
-// ================= ROT ENC API =================
 
 bool wasDialMoved() {
   if (dialMovedFlag) {
@@ -684,7 +660,7 @@ void selectChat(int pos) {
     }
     Serial.println("");
 
-    updateLEDRing(chat_index);
+    showDialPositionLED(chat_index);
 }
 
 void setLED (bool state) {
@@ -702,19 +678,42 @@ void initLEDRing() {
     FastLED.setBrightness(BRIGHTNESS);
   
     // Set initial state
-    updateLEDRing(dialPosition);
+    showBatteryLevelLED(4000);
 }
 
-// Updates the strip based on a single integer position.
-void updateLEDRing(int pos) {
+/** Updates the strip based on a single integer position.**/
+void showDialPositionLED(int pos) {
   FastLED.clear();
 
-  int ledPos = pos * 3;
+  int ledPos = pos * 3; // Every third LED is used for indication
 
   leds[ledPos] = CRGB::White;
   //leds[ledPos+1] = CRGB::White;
 
   FastLED.show();
+}
+
+void handleLEDStrip() {
+    if (showingBatteryLevel && tp_showBatteryLevelUntil - millis() < 0) {
+        showDialPositionLED(dialPosition);
+    }
+}
+
+void showBatteryLevelLED(int duration_ms) {
+    FastLED.clear();
+
+    int batteryLevel = constrain(battery_level, 0, 100); // Stay in range to be sure
+    int ledsLit = NUM_LEDS * (batteryLevel / 100);
+
+    // Fill from index 0 up to ledsLit with green
+    for (int i = 0; i < ledsLit && i < NUM_LEDS; i++) {
+        leds[i] = CRGB::Green;
+    }
+
+    FastLED.show();
+
+    showingBatteryLevel = true;
+    tp_showBatteryLevelUntil = millis() + duration_ms;
 }
 
 void indicatorFlash() {
@@ -723,14 +722,14 @@ void indicatorFlash() {
 
   delay(100);
 
-  updateLEDRing(dialPosition);
+  showDialPositionLED(dialPosition);
 }
 
 
 
 // CHAT & PLAYBACK CONTROL ==============================
 
-// Plays a new message, either already on device or fetched. For the user, this acts like it goes online everytime
+/** Plays a new message, either already on device or fetched. For the user, this acts like it goes online everytime **/
 void playNewMessage() {
     if (isRecording) return;
     if (isTranscoding) return;
@@ -773,7 +772,7 @@ void playChatWrapper() {
     battery.subtractListen();
 }
 
-// Play the last messages in a chat folder, transcode them if specified
+/** Play the last messages in a chat folder, transcode them if specified**/
 void playChat(const char* chatId) {
     if (isRecording) return;
     if (isTranscoding) return;
@@ -845,7 +844,7 @@ void convertExtension_ogg2wav(const char* oggStr, char* wavStr) {
     }
 }
 
-// Scans a folder to find the next available sequential number for a specific prefix
+/** Scans a folder to find the next available sequential number for a specific prefix**/
 int getNextFileIndex(const char* folderPath, const char* prefix) {
     File dir = SD_MMC.open(folderPath);
     if (!dir) return 0;
@@ -867,7 +866,7 @@ int getNextFileIndex(const char* folderPath, const char* prefix) {
     return maxIndex + 1; // Return the next number
 }
 
-// Only ever keep all the last received OR all the last recorded messages in the chat folder
+/** Only ever keep all the last received OR all the last recorded messages in the chat folder**/
 void cleanupChatFolder(const char* folderPath, const char* prefix) {
     File dir = SD_MMC.open(folderPath);
     if (!dir) return;
@@ -888,7 +887,7 @@ void cleanupChatFolder(const char* folderPath, const char* prefix) {
     dir.close();
 }
 
-// Tells whether there are new messages already on the device
+/** Tells whether there are new messages already on the device**/
 bool hasChatsWithNews(int* printNumber_optional) {
     if (printNumber_optional == nullptr) {
         for(int i = 0; i < max_chats; i++) {
@@ -906,12 +905,12 @@ bool hasChatsWithNews(int* printNumber_optional) {
     }
 }
 
-// Get chatId by chatIndex
+/** Get chatId by chatIndex**/
 const char* getChatId() {
     return chat_ids[chat_index];
 }
 
-// Get the chatIndex by chatId
+/** Get the chatIndex by chatId**/
 int findChatId(const char* chatId) {
   for(int i = 0; i < max_chats; i++) {
     if(strcmp(chatId, chat_ids[i]) == 0) return i;
@@ -919,7 +918,7 @@ int findChatId(const char* chatId) {
   return -1;
 }
 
-// Is this chatId within the contacts?
+/**Is this chatId within the contacts?**/
 bool isValidChat(const char* chat_id, int* printIndex_optional) {
     for (int i = 0; i < max_chats; i++)
     {
@@ -976,6 +975,8 @@ void handleAutoSleep() {
 void resetAutoSleep() {
     tp_lastInteraction_millis = millis();
 }
+
+
 
 
 
@@ -1193,7 +1194,11 @@ bool initSDCard() {
     return true;
 }
 
-// SENDING
+
+
+
+
+// SENDING ========================================================
 
 void sendWavFile(const char* filePath, const char* fileName, const char* chat_id) {
 
@@ -1578,6 +1583,30 @@ void setI2SData_recording() {
 
 
 // AUDIO TRANSCODING ==========================================
+
+void initTranscoder() {
+    if(transcoderInitialized) return;
+    
+    // Initialize transcoding system for potential message processing
+    // Create the gate (binary semaphore starts "taken")
+    startTranscodeGate = xSemaphoreCreateBinary();
+
+    AudioInfo info_transcoding;
+    info_transcoding.sample_rate = 48000;
+    info_transcoding.channels = 1;
+    info_transcoding.bits_per_sample = 16;
+
+    decoder_opusOgg.setAudioInfo(info_transcoding);
+    encoder_wav.setAudioInfo(info_transcoding);
+
+    // Create a queue capable of holding up to 5 pending transcode jobs
+    jobQueue = xQueueCreate(5, sizeof(TranscodeJob));
+
+    // Create the persistent FreeRTOS Task
+    xTaskCreatePinnedToCore(transcodeTask, "TranscodeTask", 16384, NULL, 1, &transcodeTaskHandle, 1);
+
+    transcoderInitialized = true;
+}
 
 void addTranscodeJob(const char* oggFile, const char* wavFile) {
     isTranscoding = true;
