@@ -94,6 +94,7 @@ struct Button {
 };
 
 Button button = {BUTTON, HIGH, 0, false, false, playNewMessage, startRecording, stopRecording};
+bool buttonActive = false;
 
 // Rotary Encoder ----------------
 
@@ -467,8 +468,6 @@ void setupUsageMode() {
     initTranscoder();
 
     Serial.println("[SYSTEM] Ready.");
-
-    //fetchMessages();
 }
 
 void goToSleep() {
@@ -500,6 +499,7 @@ void goToSleep() {
 void loop() {
     processAudio();
 
+    if(!buttonActive && millis() > 4000) buttonActive = true; // Activate button with delay
     handleButton(button, "button");
 
     handleDial();
@@ -537,38 +537,40 @@ void loop() {
 // USER CONTROL ==============================
 
 void handleButton(Button &btn, const char* name) {
-  bool currentState = digitalRead(btn.pin);
+    if(!buttonActive) return;
 
-  // Button Pressed (Falling edge)
-  if (currentState == LOW && btn.lastState == HIGH) {
-    btn.pressStartTime = millis();
-    btn.isPressed = true;
-    btn.isHolding = false;
-    delay(20); // Basic debounce
-  }
+    bool currentState = digitalRead(btn.pin);
 
-  // Button Released (Rising edge)
-  if (currentState == HIGH && btn.lastState == LOW) {
-    resetAutoSleep(); // Every interaction with the device resets autosleep
-
-    if (!btn.isHolding) {
-      Serial.printf("%s: Short Press\n", name);
-      if (btn.onShortPress) btn.onShortPress();
-    } 
-    else { 
-      if (btn.onRelease) btn.onRelease();
+    // Button Pressed (Falling edge, LOW --> HIGH)
+    if (currentState == LOW && btn.lastState == HIGH) {
+        btn.pressStartTime = millis();
+        btn.isPressed = true;
+        btn.isHolding = false;
+        delay(20); // Basic debounce
     }
-    btn.isPressed = false;
-  }
 
-  // Check for Long Press
-  if (btn.isPressed && !btn.isHolding && (millis() - btn.pressStartTime > SHORT_PRESS_TIME)) {
-    Serial.printf("%s: Long Press (Hold)\n", name);
-    if (btn.onHold) btn.onHold();
-    btn.isHolding = true;
-  }
+    // Button Released (Rising edge, HIGH --> LOW)
+    if (currentState == HIGH && btn.lastState == LOW) {
+        resetAutoSleep(); // Every interaction with the device resets autosleep
 
-  btn.lastState = currentState;
+        if (!btn.isHolding) {
+        Serial.printf("%s: Short Press\n", name);
+        if (btn.onShortPress) btn.onShortPress();
+        } 
+        else { 
+        if (btn.onRelease) btn.onRelease();
+        }
+        btn.isPressed = false;
+    }
+
+    // Check for Long Press
+    if (btn.isPressed && !btn.isHolding && (millis() - btn.pressStartTime > SHORT_PRESS_TIME)) {
+        Serial.printf("%s: Long Press (Hold)\n", name);
+        if (btn.onHold) btn.onHold();
+        btn.isHolding = true;
+    }
+
+    btn.lastState = currentState;
 }
 
 void doNothing() {} // Helper function to prevent crash if an event is unassigned
