@@ -94,7 +94,7 @@ struct Button {
   ButtonEvent onRelease;
 };
 
-Button button = {BUTTON, HIGH, 0, false, false, playNewMessage, startRecording, stopRecording};
+Button button = {BUTTON, HIGH, 0, false, false, doNothing, startRecording, stopRecording};
 bool buttonActive = false;
 
 // Rotary Encoder ----------------
@@ -192,7 +192,7 @@ RTC_DATA_ATTR bool newMessages[max_chats] = {false};
 
 // BATTERY & SYSTEM BEHAVIOR =========================
 
-RTC_DATA_ATTR int battery_level = 500;
+RTC_DATA_ATTR int battery_level = 650;
 
 struct Battery {
 
@@ -546,11 +546,11 @@ void handleButton(Button &btn, const char* name) {
         resetAutoSleep(); // Every interaction with the device resets autosleep
 
         if (!btn.isHolding) {
-        Serial.printf("%s: Short Press\n", name);
-        if (btn.onShortPress) btn.onShortPress();
+            Serial.printf("%s: Short Press\n", name);
+            if (btn.onShortPress) btn.onShortPress();
         } 
         else { 
-        if (btn.onRelease) btn.onRelease();
+            if (btn.onRelease) btn.onRelease();
         }
         btn.isPressed = false;
     }
@@ -606,7 +606,7 @@ void handleDial() {
     dialPosition = newDial;
     lastDialPosition = newDial;
     dialMovedFlag = true;
-    Serial.println("Dial pos set to: "); Serial.println(newDial);
+    //Serial.println("Dial pos set to: "); Serial.println(newDial);
   }
 
   // Handle button ----
