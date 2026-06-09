@@ -27,6 +27,8 @@ void playChatWrapper();
 void playChat(const char* chatId);
 bool isValidChat(const char* chat_id, int* printIndex_optional = nullptr);
 void chargeBattery();
+void measureBrightnessWrapper();
+int measureBrightness();
 void handleBehavior(unsigned long tp_now);
 bool downloadTelegramFile(const char* fileId, const char* destination);
 void cleanupChatFolder(const char* folderPath, const char* prefix);
@@ -51,6 +53,10 @@ void setI2SData_recording();
 void addTranscodeJob(const char* oggFile, const char* wavFile);
 void transcodeTask(void *pvParameters);
 void blinkLED(int times, int delay_ms);
+void showBatteryLevelLEDWrapper();
+void showBatteryLevelLED(int duration_ms);
+void setNewMessageLED(int chatIdx);
+void indicatorFlash();
 
 // ==========================================================================================
 
@@ -198,9 +204,9 @@ RTC_DATA_ATTR int battery_level = 650;
 
 struct Battery {
 
-    int cost_send = 300;
-    int cost_update = 300;
-    int cost_listen = 50;
+    int cost_send = 150;
+    int cost_update = 150;
+    int cost_listen = 30;
 
     void chargeBy(int points) {
         battery_level += points;
@@ -550,6 +556,7 @@ void handleButton(Button &btn, const char* name) {
 
         if (!btn.isHolding) {
             Serial.printf("%s: Short Press\n", name);
+            blinkLED(1, 50);
             if (btn.onShortPress) btn.onShortPress();
         } 
         else { 
@@ -561,6 +568,7 @@ void handleButton(Button &btn, const char* name) {
     // Check for Long Press
     if (btn.isPressed && !btn.isHolding && (millis() - btn.pressStartTime > SHORT_PRESS_TIME)) {
         Serial.printf("%s: Long Press (Hold)\n", name);
+        blinkLED(1, 50);
         if (btn.onHold) btn.onHold();
         btn.isHolding = true;
     }
@@ -644,13 +652,6 @@ void selectChat(int pos) {
     showDialPositionLED(chat_index);
 }
 
-void setLED (bool state) {
-    if (state) {digitalWrite(LED_NOTIFICATION, HIGH);}
-    else digitalWrite(LED_NOTIFICATION, LOW);
-
-    state_LED = state;
-}
-
 void blinkLED(int times, int delay_ms) {
     digitalWrite(LED_NOTIFICATION, LOW);
 
@@ -678,12 +679,12 @@ void showDialPositionLED(int pos) {
   FastLED.clear();
 
   if(newMessageIndicationPos != -1) {
-    int ledPos_green = newMessageIndicationPos * 3; // Which chat to indicate
+    int ledPos_blue = newMessageIndicationPos * 3; // Which chat to indicate
 
     // Light up this chat LED plus periphery
-    leds[ledPos_green == 0 ? NUM_LEDS-1 : ledPos_green-1] = CRGB::Green;
-    leds[ledPos_green] = CRGB::Green;
-    leds[ledPos_green + 1] = CRGB::Green;
+    leds[ledPos_blue == 0 ? NUM_LEDS-1 : ledPos_blue-1] = CRGB::Blue;
+    leds[ledPos_blue] = CRGB::Blue;
+    leds[ledPos_blue + 1] = CRGB::Blue;
   }
 
   int ledPos_white = pos * 3; // Every third LED is used for indication
@@ -697,13 +698,13 @@ void handleLEDStrip() {
     
     if (showingBatteryLevel && millis() >= tp_showBatteryLevelUntil) {
         showDialPositionLED(dialPosition);
-        Serial.println("Shut off leds");
+        //Serial.println("Shut off leds");
         showingBatteryLevel = false;
     }
 }
 
 void showBatteryLevelLEDWrapper() {
-    showBatteryLevelLED(3000);
+    showBatteryLevelLED(2200);
 }
 
 void showBatteryLevelLED(int duration_ms) {
@@ -712,9 +713,13 @@ void showBatteryLevelLED(int duration_ms) {
     int batteryLevel = constrain(battery_level, 0, 1000); // Stay in range to be sure
     int ledsLit = (NUM_LEDS * batteryLevel) / 1000;
 
-    // Fill from index 0 up to ledsLit with green
-    for (int i = 0; i < ledsLit; i++) {
-        leds[i] = CRGB::Green;
+    if (ledsLit == 0) {
+        leds[0] = CRGB::Red;
+    } else {
+        // Fill from index 0 up to ledsLit with green
+        for (int i = 0; i < ledsLit; i++) {
+            leds[i] = CRGB::Green;
+        }
     }
 
     FastLED.show();
@@ -724,9 +729,9 @@ void showBatteryLevelLED(int duration_ms) {
 }
 
 void setNewMessageLED(int chatIdx) {
-    if(chatIdx != -1) newMessageIndicationPos = chatIdx;
+    newMessageIndicationPos = chatIdx;
 
-    showDialPositionLED(dialPosition);
+    if(!showingBatteryLevel) showDialPositionLED(dialPosition);
 }
 
 void indicatorFlash() {
@@ -969,6 +974,10 @@ void chargeBattery() {
     }
 }
 
+void measureBrightnessWrapper() {
+    measureBrightness();
+};
+
 int measureBrightness() {
     int sum = 0;
     int samples = 64;
@@ -980,6 +989,8 @@ int measureBrightness() {
     }
     
     int averageValue = sum / samples;
+
+    //Serial.printf("Measured brightness: %d\n", averageValue);
 
     return averageValue;
 }
@@ -1030,7 +1041,7 @@ bool fetchMessages() {
 
     Serial.println("Fetching messages...");
 
-    bool ret = (news_LED > -1); // is there already a new message signalized?
+    bool ret = (newMessageIndicationPos != -1); // is there already a new message signalized?
     if (!ret) ret = hasChatsWithNews(); // is there already a new message on the device?
     if (!ret) {
         initTranscoder();
@@ -1294,6 +1305,8 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
 
     client_upload.stop();
     Serial.printf("Senden beendet. %s\n", chat_id);
+
+    blinkLED(1, 500);
 
     delay(500);
     disconnectWiFi();
