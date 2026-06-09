@@ -18,7 +18,7 @@
 // ========================================================================================
 
 // Forward Declarations
-void playNewMessage();
+void lookForNewMessage();
 void startRecording();
 void stopRecording();
 void doNothing();
@@ -64,7 +64,7 @@ RTC_DATA_ATTR unsigned long battery_tpLastRefresh = 0;
 RTC_DATA_ATTR unsigned long totalMillis = 0;
 
 RTC_DATA_ATTR unsigned long tp_lastFetch = 0;
-#define INTERVAL_AUTO_FETCH 39600000 // 11h
+#define INTERVAL_AUTO_FETCH 18000000 // 5h
 
 unsigned long tp_lastInteraction_millis = 0;
 #define TIMER_AUTO_SLEEP 120000 // 2min
@@ -77,7 +77,7 @@ unsigned long tp_lastInteraction_millis = 0;
 #define BUTTON 8
 
 #define LED_NOTIFICATION 7
-RTC_DATA_ATTR bool state_LED = false;
+RTC_DATA_ATTR int newMessageIndicationPos = -1;
 
 const unsigned long SHORT_PRESS_TIME = 500; // Threshold for long press
 
@@ -95,7 +95,7 @@ struct Button {
 };
 
 Button button = {BUTTON, HIGH, 0, false, false, doNothing, startRecording, stopRecording};
-bool buttonActive = false;
+bool buttonsActive = false;
 
 // Rotary Encoder ----------------
 
@@ -108,6 +108,8 @@ volatile uint8_t lastState = 0;
 volatile unsigned long lastInterruptTime = 0;
 
 const unsigned long debounceMicros = 1000; // encoder debounce
+
+Button dialButton = {SW, HIGH, 0, false, false, playChatWrapper, lookForNewMessage, doNothing};
 
 // RotEnc Button
 bool buttonState = HIGH;
@@ -437,7 +439,7 @@ void setupUsageMode() {
 
     setI2SData_playback();
 
-    digitalWrite(LED_NOTIFICATION, state_LED);
+    setNewMessageLED(newMessageIndicationPos); // Light up potential new messages
 
     // Initialize Audio Recording -----------------------
 
@@ -492,8 +494,9 @@ void goToSleep() {
 void loop() {
     processAudio();
 
-    if(!buttonActive && millis() > 4000) buttonActive = true; // Activate button with delay
+    if(!buttonsActive && millis() > 4000) buttonsActive = true; // Activate buttons with delay
     handleButton(button, "button");
+    handleButton(dialButton, "dialButton");
 
     handleDial();
     handleLEDStrip();
@@ -529,7 +532,7 @@ void loop() {
 // USER CONTROL ==============================
 
 void handleButton(Button &btn, const char* name) {
-    if(!buttonActive) return;
+    if(!buttonsActive) return;
 
     bool currentState = digitalRead(btn.pin);
 
@@ -608,25 +611,6 @@ void handleDial() {
     dialMovedFlag = true;
     //Serial.println("Dial pos set to: "); Serial.println(newDial);
   }
-
-  // Handle button ----
-  int reading = digitalRead(SW);
-
-  if (reading != lastButtonState) {
-    lastButtonDebounceTime = millis();
-  }
-
-  if ((millis() - lastButtonDebounceTime) > buttonDebounce) {
-    if (reading != buttonState) {
-      buttonState = reading;
-
-      if (buttonState == LOW) {
-        buttonPressedFlag = true;
-      }
-    }
-  }
-
-  lastButtonState = reading;
 }
 
 bool wasDialMoved() {
@@ -693,10 +677,18 @@ void initLEDRing() {
 void showDialPositionLED(int pos) {
   FastLED.clear();
 
-  int ledPos = pos * 3; // Every third LED is used for indication
+  if(newMessageIndicationPos != -1) {
+    int ledPos_green = newMessageIndicationPos * 3; // Which chat to indicate
 
-  leds[ledPos] = CRGB::White;
-  //leds[ledPos+1] = CRGB::White;
+    // Light up this chat LED plus periphery
+    leds[ledPos_green == 0 ? NUM_LEDS-1 : ledPos_green-1] = CRGB::Green;
+    leds[ledPos_green] = CRGB::Green;
+    leds[ledPos_green + 1] = CRGB::Green;
+  }
+
+  int ledPos_white = pos * 3; // Every third LED is used for indication
+
+  leds[ledPos_white] = CRGB::White;
 
   FastLED.show();
 }
@@ -727,6 +719,12 @@ void showBatteryLevelLED(int duration_ms) {
     tp_showBatteryLevelUntil = millis() + duration_ms;
 }
 
+void setNewMessageLED(int chatIdx) {
+    if(chatIdx != -1) newMessageIndicationPos = chatIdx;
+
+    showDialPositionLED(dialPosition);
+}
+
 void indicatorFlash() {
   FastLED.clear();
   FastLED.show();
@@ -740,14 +738,15 @@ void indicatorFlash() {
 
 // CHAT & PLAYBACK CONTROL ==============================
 
-/** Plays a new message, either already on device or fetched. For the user, this acts like it goes online everytime **/
-void playNewMessage() {
+/** Looks for a new message, either already on device or fetched. For the user, this acts like it goes online everytime **/
+void lookForNewMessage() {
     if (isRecording) return;
     if (isTranscoding) return;
     if (isAudioRunning) return;
 
     if (!fetchMessages()) {
         Serial.println("[MESSAGE] No new messages :(");
+        blinkLED(2, 500);
         return;
     };
 
@@ -764,21 +763,22 @@ void playNewMessage() {
         for(int i = 0; i < max_chats; i++) {
             if(newMessages[i]) chats_indices[j++] = i; // fill array
         }
-        int randomChatIndex = (totalMillis + millis()) % chatsWithNews; // pick a random chat
-        chat_index = randomChatIndex;
-        playChat(chat_ids[chats_indices[randomChatIndex]]); // play it back
+        int randomPick = (totalMillis + millis()) % chatsWithNews; // pick a random chat
+
+        //playChat(chat_ids[chats_indices[randomPick]]); // play it back
+        setNewMessageLED(chats_indices[randomPick]); // Indicate it on LED ring
     } else {
         Serial.println("[ERROR] Chats with new messages weren't found");
         return;
     }
 
-    setLED(false);
+    blinkLED(2, 500);
 }
 
 void playChatWrapper() {
     if (!battery.canListen()) return;
 
-    if (state_LED && newMessages[chat_index]) setLED(false); // if we manually selected the chat with new messages -> turn off light
+    if (newMessageIndicationPos == chat_index) setNewMessageLED(-1); // if we manually selected the chat with new messages -> turn off light
     playChat(getChatId());
     battery.subtractListen();
 }
@@ -983,20 +983,20 @@ int measureBrightness() {
 void handleBehavior(unsigned long tp_now) {
     unsigned long timeSinceLastFetch = tp_now - tp_lastFetch;
 
-    // Fetch every 11h no matter what, to make sure no messages get lost on telegrams servers (after 24h)
+    // Fetch every 5h no matter what, to make sure no messages get lost on telegrams servers (after 24h)
     if (timeSinceLastFetch > INTERVAL_AUTO_FETCH) {
         initTranscoder();
         processTelegramUpdates();
         tp_lastFetch = tp_now;
     }
 
-    // Every hour, if no new messages indicated, if enough battery -> "fetch" a new message
+    // Every hour, if no new messages indicated, if enough battery -> look for a new message to indicate
     else if (
-        !state_LED &&
+        newMessageIndicationPos == -1 &&
         timeSinceLastFetch > 3600000 /*1h*/ && 
         battery_level >= 600
     ){
-        fetchMessages();
+        lookForNewMessage();
     }
 }
 
@@ -1026,13 +1026,15 @@ bool fetchMessages() {
 
     Serial.println("Fetching messages...");
 
-    bool ret = state_LED; // is there already a new message signalized?
+    bool ret = (news_LED > -1); // is there already a new message signalized?
     if (!ret) ret = hasChatsWithNews(); // is there already a new message on the device?
     if (!ret) {
         initTranscoder();
         ret = processTelegramUpdates(); // are there new messages online?
     }
-    if(ret) setLED(true); // turn on notification light
+    if(ret) {
+        int chatWithNews = 0;
+    } // turn on notification light
 
     battery.subtractUpdate();
     tp_lastFetch = totalMillis + millis();
