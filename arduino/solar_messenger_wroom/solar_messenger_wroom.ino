@@ -94,7 +94,7 @@ struct Button {
   ButtonEvent onRelease;
 };
 
-Button button = {BUTTON, HIGH, 0, false, false, doNothing, startRecording, stopRecording};
+Button button = {BUTTON, HIGH, 0, false, false, showBatteryLevelLEDWrapper, startRecording, stopRecording};
 bool buttonsActive = false;
 
 // Rotary Encoder ----------------
@@ -670,7 +670,7 @@ void initLEDRing() {
     FastLED.setBrightness(BRIGHTNESS);
   
     // Set initial state
-    showBatteryLevelLED(3000);
+    showBatteryLevelLEDWrapper();
 }
 
 /** Updates the strip based on a single integer position.**/
@@ -700,6 +700,10 @@ void handleLEDStrip() {
         Serial.println("Shut off leds");
         showingBatteryLevel = false;
     }
+}
+
+void showBatteryLevelLEDWrapper() {
+    showBatteryLevelLED(3000);
 }
 
 void showBatteryLevelLED(int duration_ms) {
