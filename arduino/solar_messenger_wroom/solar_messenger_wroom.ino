@@ -70,10 +70,10 @@ RTC_DATA_ATTR unsigned long battery_tpLastRefresh = 0;
 RTC_DATA_ATTR unsigned long totalMillis = 0;
 
 RTC_DATA_ATTR unsigned long tp_lastFetch = 0;
-#define INTERVAL_AUTO_FETCH 18000000 // 5h
+#define INTERVAL_AUTO_FETCH 39600000 // 11h
 
 unsigned long tp_lastInteraction_millis = 0;
-#define TIMER_AUTO_SLEEP 120000 // 2min
+#define TIMER_AUTO_SLEEP 20000 // 20sec
 
 
 // USER INTERFACE ==============================
@@ -697,9 +697,15 @@ void showDialPositionLED(int pos) {
 void handleLEDStrip() {
     
     if (showingBatteryLevel && millis() >= tp_showBatteryLevelUntil) {
-        showDialPositionLED(dialPosition);
-        //Serial.println("Shut off leds");
-        showingBatteryLevel = false;
+
+        if(battery_level < min(battery.cost_listen, battery.cost_send, battery.cost_update)) {
+            goToSleep();
+        } else {
+            showDialPositionLED(dialPosition);
+            //Serial.println("Shut off leds");
+            showingBatteryLevel = false;
+        }
+        
     }
 }
 
@@ -713,7 +719,7 @@ void showBatteryLevelLED(int duration_ms) {
     int batteryLevel = constrain(battery_level, 0, 1000); // Stay in range to be sure
     int ledsLit = (NUM_LEDS * batteryLevel) / 1000;
 
-    if (ledsLit == 0) {
+    if(ledsLit == 0 || battery_level < min(battery.cost_listen, battery.cost_send, battery.cost_update)) {
         leds[0] = CRGB::Red;
     } else {
         // Fill from index 0 up to ledsLit with green
