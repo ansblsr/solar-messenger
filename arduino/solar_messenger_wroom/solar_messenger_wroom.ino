@@ -52,13 +52,15 @@ void sdWriteTask(void *pvParameters);
 void setI2SData_recording();
 void addTranscodeJob(const char* oggFile, const char* wavFile);
 void transcodeTask(void *pvParameters);
-void blinkLED(int times, int delay_ms);
+void blinkLED(int times, int onTime_ms, int offTime_ms);
 void showBatteryLevelLEDWrapper();
 void showBatteryLevelLED(int duration_ms);
 void setNewMessageLED(int chatIdx);
 void indicatorFlash();
 
 // ==========================================================================================
+
+bool debugFlag = true;
 
 // POWER MANAGEMENT ============================
 
@@ -217,10 +219,10 @@ struct Battery {
         if (battery_level >= cost_send) {
             return true;
         } else {
-            Serial.println("[BATTERY] Action not possible, need more sun :)1");
+            if(debugFlag) Serial.println("[BATTERY] Action not possible, need more sun :)1");
 
             // LED blink to signalize system
-            blinkLED(3, 100);
+            blinkLED(3, 100, 100);
 
             return false;
         };
@@ -230,10 +232,10 @@ struct Battery {
         if (battery_level >= cost_update) {
             return true;
         } else {
-            Serial.println("[BATTERY] Action not possible, need more sun :)2");
+            if(debugFlag) Serial.println("[BATTERY] Action not possible, need more sun :)2");
 
             // LED blink to signalize system
-            blinkLED(3, 100);
+            blinkLED(3, 100, 100);
 
             return false;
         };
@@ -243,10 +245,10 @@ struct Battery {
         if (battery_level >= cost_listen) {
             return true;
         } else {
-            Serial.println("[BATTERY] Action not possible, need more sun :)3");
+            if(debugFlag) Serial.println("[BATTERY] Action not possible, need more sun :)3");
 
             // LED blink to signalize system
-            blinkLED(3, 100);
+            blinkLED(3, 100, 100);
 
             return false;
         };
@@ -386,7 +388,7 @@ void setup() {
     }
 
     bootCount++;
-    Serial.printf(" Just woke up. Boot count: %d\n", bootCount);
+    if(debugFlag) Serial.printf(" Just woke up. Boot count: %d\n", bootCount);
 
     resetAutoSleep();
 
@@ -408,7 +410,7 @@ void setup() {
 
 // This runs every X minutes
 void setupSensingMode() {
-    Serial.println("Running sensing mode...");
+    if(debugFlag) Serial.println("Running sensing mode...");
 
     analogSetAttenuation(ADC_11db);
 
@@ -429,7 +431,7 @@ void setupSensingMode() {
 
 // This runs on user interaction
 void setupUsageMode() {
-    Serial.println("Running usage mode...");
+    if(debugFlag) Serial.println("Running usage mode...");
 
     // Pins
     pinMode(BUTTON, INPUT_PULLUP);
@@ -437,7 +439,7 @@ void setupUsageMode() {
 
     //AudioLogger::instance().begin(Serial, AudioLogger::Debug);
 
-    Serial.println("\n[SYSTEM] Initializing...");
+    if(debugFlag) Serial.println("\n[SYSTEM] Initializing...");
 
     initSDCard();
     initDial();
@@ -468,7 +470,7 @@ void setupUsageMode() {
     // Audio Transcoding -------------------------
     initTranscoder();
 
-    Serial.println("[SYSTEM] Ready.");
+    if(debugFlag) Serial.println("[SYSTEM] Ready.");
 }
 
 void goToSleep() {
@@ -490,7 +492,7 @@ void goToSleep() {
 
     totalMillis += millis(); // add the time you took for this execution cycle
 
-    Serial.println("Going back to sleep...");
+    if(debugFlag) Serial.println("Going back to sleep...");
 
     // Go back to sleep
     esp_deep_sleep_start();
@@ -555,8 +557,8 @@ void handleButton(Button &btn, const char* name) {
         resetAutoSleep(); // Every interaction with the device resets autosleep
 
         if (!btn.isHolding) {
-            Serial.printf("%s: Short Press\n", name);
-            blinkLED(1, 50);
+            if(debugFlag) Serial.printf("%s: Short Press\n", name);
+            blinkLED(1, 50, 50);
             if (btn.onShortPress) btn.onShortPress();
         } 
         else { 
@@ -567,8 +569,8 @@ void handleButton(Button &btn, const char* name) {
 
     // Check for Long Press
     if (btn.isPressed && !btn.isHolding && (millis() - btn.pressStartTime > SHORT_PRESS_TIME)) {
-        Serial.printf("%s: Long Press (Hold)\n", name);
-        blinkLED(1, 50);
+        if(debugFlag) Serial.printf("%s: Long Press (Hold)\n", name);
+        blinkLED(1, 50, 50);
         if (btn.onHold) btn.onHold();
         btn.isHolding = true;
     }
@@ -642,24 +644,25 @@ void selectChat(int pos) {
 
     chat_index = constrain(pos, 0, max_chats);
 
-    Serial.printf("[DIAL] Changed chat to index: %d \n", chat_index);
-    Serial.print("New Messages: "); 
+    if(debugFlag) Serial.printf("[DIAL] Changed chat to index: %d \n", chat_index);
+    if(debugFlag) Serial.print("New Messages: "); 
     for(int i = 0; i < 5; i++) {
-      Serial.print(newMessages[i]);
+      if(debugFlag) Serial.print(newMessages[i]);
     }
-    Serial.println("");
+    if(debugFlag) Serial.println("");
 
     showDialPositionLED(chat_index);
 }
 
-void blinkLED(int times, int delay_ms) {
+void blinkLED(int times, int onTime_ms, int offTime_ms) {
     digitalWrite(LED_NOTIFICATION, LOW);
+    delay(offTime_ms);
 
     for(int i = 0; i < times; i++) {
         digitalWrite(LED_NOTIFICATION, HIGH);
-        delay(delay_ms);
+        delay(onTime_ms);
         digitalWrite(LED_NOTIFICATION, LOW);
-        delay(delay_ms);
+        delay(offTime_ms);
     }
 }
 
@@ -702,7 +705,7 @@ void handleLEDStrip() {
             goToSleep();
         } else {
             showDialPositionLED(dialPosition);
-            //Serial.println("Shut off leds");
+            //if(debugFlag) Serial.println("Shut off leds");
             showingBatteryLevel = false;
         }
         
@@ -759,13 +762,19 @@ void lookForNewMessage() {
     if (isTranscoding) return;
     if (isAudioRunning) return;
 
+    digitalWrite(LED_NOTIFICATION, HIGH);
+
     if (!fetchMessages()) {
-        Serial.println("[MESSAGE] No new messages :(");
-        blinkLED(2, 500);
+        if(debugFlag) Serial.println("[MESSAGE] No new messages :(");
+        blinkLED(2, 500, 500);
         return;
     };
 
-    while (isTranscoding) {}
+    digitalWrite(LED_NOTIFICATION, LOW);
+
+    while (isTranscoding) {
+        blinkLED(5, 20, 300);
+    }
     
     // New messages have been "fetched"
 
@@ -783,14 +792,19 @@ void lookForNewMessage() {
         //playChat(chat_ids[chats_indices[randomPick]]); // play it back
         setNewMessageLED(chats_indices[randomPick]); // Indicate it on LED ring
     } else {
-        Serial.println("[ERROR] Chats with new messages weren't found");
+        if(debugFlag) Serial.println("[ERROR] Chats with new messages weren't found");
         return;
     }
 
-    blinkLED(2, 500);
+    blinkLED(2, 500, 500);
 }
 
 void playChatWrapper() {
+    if (isAudioRunning) {
+        stopPlayback();
+        return;
+    }
+
     if (!battery.canListen()) return;
 
     if (newMessageIndicationPos == chat_index) setNewMessageLED(-1); // if we manually selected the chat with new messages -> turn off light
@@ -808,7 +822,7 @@ void playChat(const char* chatId) {
 
     File dir = SD_MMC.open(folderPath);
     if (!dir) {
-        Serial.println("[ERROR] Directory was not found");
+        if(debugFlag) Serial.println("[ERROR] Directory was not found");
         return;
     };
 
@@ -976,7 +990,7 @@ void chargeBattery() {
         else chargeAmount = 16; // Bright outdoors (3,125h until full)
 
         battery.chargeBy(chargeAmount);
-        Serial.printf("Battery level: %d\n", battery_level);
+        if(debugFlag) Serial.printf("Battery level: %d\n", battery_level);
     }
 }
 
@@ -996,7 +1010,7 @@ int measureBrightness() {
     
     int averageValue = sum / samples;
 
-    //Serial.printf("Measured brightness: %d\n", averageValue);
+    //if(debugFlag) Serial.printf("Measured brightness: %d\n", averageValue);
 
     return averageValue;
 }
@@ -1045,7 +1059,7 @@ void resetAutoSleep() {
 bool fetchMessages() {
     if (!battery.canFetch()) return false;
 
-    Serial.println("Fetching messages...");
+    if(debugFlag) Serial.println("Fetching messages...");
 
     bool ret = (newMessageIndicationPos != -1); // is there already a new message signalized?
     if (!ret) ret = hasChatsWithNews(); // is there already a new message on the device?
@@ -1070,7 +1084,7 @@ bool processTelegramUpdates() {
     // ensure WiFi connection
     if (!tryConnectWiFi(30000)) return false;
 
-    Serial.println("Telegram API: /getUpdates");
+    if(debugFlag) Serial.println("Telegram API: /getUpdates");
 
     char getUpdates_url[256];
     snprintf(getUpdates_url, sizeof(getUpdates_url), "https://api.telegram.org/bot%s/getUpdates?offset=%ld&limit=5", BOT_TOKEN, lastUpdateId + 1);
@@ -1089,7 +1103,7 @@ bool processTelegramUpdates() {
             JsonArray results = doc_updates["result"].as<JsonArray>();
 
             if (results.size() == 0) {
-                Serial.println("[OK] No new messages found");
+                if(debugFlag) Serial.println("[OK] No new messages found");
             }
 
             // ensure SD card initialized
@@ -1101,29 +1115,29 @@ bool processTelegramUpdates() {
                 lastUpdateId = currentResult["update_id"] | 0;
 
                 if (lastUpdateId == 0) {
-                    Serial.print("[ERROR] Update ID was 0");
+                    if(debugFlag) Serial.print("[ERROR] Update ID was 0");
                     continue;
                 }
                 
-                Serial.printf("\nNEW MESSAGE (Update ID: %ld\n)", lastUpdateId);
+                if(debugFlag) Serial.printf("\nNEW MESSAGE (Update ID: %ld\n)", lastUpdateId);
                 
                 JsonObject message = currentResult["message"];
                 const char* fromName = message["from"]["first_name"] | "Unknown";
                 long long chatId = message["chat"]["id"].as<long long>() | 0;
                 
-                Serial.printf("From: %s     Chat ID: %lld\n", fromName, chatId);
+                if(debugFlag) Serial.printf("From: %s     Chat ID: %lld\n", fromName, chatId);
 
                 char chatId_str[14]; snprintf(chatId_str, sizeof(chatId_str), "%lld", chatId);
 
                 int chatIndex = -1; // gets filled in by isValidChat()
                 if (!isValidChat(chatId_str, &chatIndex)) {
-                    Serial.println("[ERROR] chat id is unknown");
+                    if(debugFlag) Serial.println("[ERROR] chat id is unknown");
                     continue;
                 }
 
                 // Voice Message?
                 if (message.containsKey("voice")) {
-                    Serial.println("Type: VoiceMessage");
+                    if(debugFlag) Serial.println("Type: VoiceMessage");
 
                     const char* fileId = message["voice"]["file_id"];
 
@@ -1164,20 +1178,20 @@ bool processTelegramUpdates() {
                 // Text Message?
                 else if (message.containsKey("text")) {
                     const char* text = message["text"];
-                    Serial.print("Type: Text -> Content: ");
-                    Serial.println(text);
+                    if(debugFlag) Serial.print("Type: Text -> Content: ");
+                    if(debugFlag) Serial.println(text);
                 }
 
                 // Other Message?
                 else {
-                    Serial.println("Type: OTHER");
+                    if(debugFlag) Serial.println("Type: OTHER");
                 }
             }
         } else {
-            Serial.printf("[ERROR] Parsing failed: %s\n", error.c_str());
+            if(debugFlag) Serial.printf("[ERROR] Parsing failed: %s\n", error.c_str());
         }
     } else {
-        Serial.println("[ERROR] GET request failed");
+        if(debugFlag) Serial.println("[ERROR] GET request failed");
     }
     http_getFile.end();
     delay(500);
@@ -1196,7 +1210,7 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
     // ensure SD card initialized
     if (!initSDCard()) return false;
 
-    Serial.println("Telegram API: /getFile");
+    if(debugFlag) Serial.println("Telegram API: /getFile");
     
     char getFile_url[256];
     snprintf(getFile_url, sizeof(getFile_url), "https://api.telegram.org/bot%s/getFile?file_id=%s", BOT_TOKEN, fileId);
@@ -1215,8 +1229,8 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
             char download_url[256];
             snprintf(download_url, sizeof(download_url), "https://api.telegram.org/file/bot%s/%s", BOT_TOKEN, filePath); 
             
-            Serial.print("Downloading File URL: ");
-            Serial.println(download_url);
+            if(debugFlag) Serial.print("Downloading File URL: ");
+            if(debugFlag) Serial.println(download_url);
 
             HTTPClient http_download;
             http_download.begin(client_wifi, download_url);
@@ -1227,7 +1241,7 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
                 if (f) {
                     http_download.writeToStream(&f);
                     f.close();
-                    Serial.println("Download successful.");
+                    if(debugFlag) Serial.println("Download successful.");
                     http_download.end();
                     http_getFile.end();
                     return true;
@@ -1237,7 +1251,7 @@ bool downloadTelegramFile(const char* fileId, const char* destination) {
         }
     }
     
-    Serial.println("[ERROR] Failed to download file.");
+    if(debugFlag) Serial.println("[ERROR] Failed to download file.");
     http_getFile.end();
     return false;
 }
@@ -1246,10 +1260,10 @@ bool initSDCard() {
     SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
 
     if (!SD_MMC.begin("/sdcard", true)) {
-        Serial.println("[CRITICAL] SD Card Mount Failed!");
+        if(debugFlag) Serial.println("[CRITICAL] SD Card Mount Failed!");
         return false;
     }
-    Serial.println("[OK] SD Card Initialized.");
+    if(debugFlag) Serial.println("[OK] SD Card Initialized.");
     return true;
 }
 
@@ -1265,18 +1279,18 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
 
     File f = SD_MMC.open(filePath);
     if (!f) {
-        Serial.println("[ERROR] Could not open file for upload");
+        if(debugFlag) Serial.println("[ERROR] Could not open file for upload");
         return;
     }
 
-    Serial.println("Sending file...");
+    if(debugFlag) Serial.println("Sending file...");
 
     size_t fileSize = f.size();
     WiFiClientSecure client_upload;
     client_upload.setInsecure();
 
     if (!client_upload.connect("api.telegram.org", 443)) {
-        Serial.println("[ERROR] Connection to Telegram failed");
+        if(debugFlag) Serial.println("[ERROR] Connection to Telegram failed");
         f.close();
         return;
     }
@@ -1310,9 +1324,9 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
     client_upload.print(partFooter);
 
     client_upload.stop();
-    Serial.printf("Senden beendet. %s\n", chat_id);
+    if(debugFlag) Serial.printf("Senden beendet. %s\n", chat_id);
 
-    blinkLED(1, 500);
+    blinkLED(1, 500, 500);
 
     delay(500);
     disconnectWiFi();
@@ -1325,12 +1339,12 @@ bool tryConnectWiFi(int timeout_ms) {
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("[SYSTEM] Connecting to WiFi");
+    if(debugFlag) Serial.print("[SYSTEM] Connecting to WiFi");
     
     unsigned long startAttemptTime = millis();
     bool led_blink = false;
     while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout_ms) {
-        Serial.print(".");
+        if(debugFlag) Serial.print(".");
         //led_blink = !led_blink;
         //digitalWrite(LED_NOTIFICATION, led_blink);
 
@@ -1338,20 +1352,20 @@ bool tryConnectWiFi(int timeout_ms) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
+        if(debugFlag) Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
 
         // LED blink to signalize system
-        blinkLED(7, 100);
+        blinkLED(7, 100, 100);
 
         return false;
     }
     else {
-        Serial.println("\n[OK] WiFi connected.");
+        if(debugFlag) Serial.println("\n[OK] WiFi connected.");
         digitalWrite(LED_NOTIFICATION, LOW);
 
         // Time syncing
 
-        Serial.println("[SYSTEM] Syncing time...");
+        if(debugFlag) Serial.println("[SYSTEM] Syncing time...");
         configTime(0, 0, "pool.ntp.org", "time.google.com");
         
         time_t now = time(nullptr);
@@ -1363,9 +1377,9 @@ bool tryConnectWiFi(int timeout_ms) {
         }
         
         if (now < 24 * 3600) {
-            Serial.println("[WARNING] Time sync failed. SSL certificates might fail.");
+            if(debugFlag) Serial.println("[WARNING] Time sync failed. SSL certificates might fail.");
         } else {
-            Serial.println("[OK] Time synced.");
+            if(debugFlag) Serial.println("[OK] Time synced.");
         }
     }
 
@@ -1378,7 +1392,7 @@ void disconnectWiFi() {
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    Serial.println("Disconnected WiFi\n");
+    if(debugFlag) Serial.println("Disconnected WiFi\n");
 }
 
 
@@ -1394,8 +1408,8 @@ void startPlayback(const char* filePath) {
     
     audioFile = SD_MMC.open(filePath);
     if (!audioFile) {
-        Serial.print("Error: Could not open ");
-        Serial.println(filePath);
+        if(debugFlag) Serial.print("Error: Could not open ");
+        if(debugFlag) Serial.println(filePath);
         return;
     }
 
@@ -1407,7 +1421,7 @@ void startPlayback(const char* filePath) {
     
     isAudioRunning = true;
 
-    Serial.print("Playback started...");
+    if(debugFlag) Serial.print("Playback started...");
 }
 
 void stopPlayback() {
@@ -1418,7 +1432,7 @@ void stopPlayback() {
         
         if (audioFile) audioFile.close();
 
-        Serial.println(" --> Done.");
+        if(debugFlag) Serial.println(" --> Done.");
 
         resetAutoSleep();
     }
@@ -1511,7 +1525,7 @@ void recordTask(void *pvParameters) {
                     xQueueSend(emptyQueue, &buf, portMAX_DELAY);
                 }
             } else {
-                Serial.println("Warning: Queue Full/Buffer Overflow! SD card too slow.");
+                if(debugFlag) Serial.println("Warning: Queue Full/Buffer Overflow! SD card too slow.");
                 // Prevent task watchdogs from panicking during overflow
                 vTaskDelay(pdMS_TO_TICKS(5)); 
             }
@@ -1552,10 +1566,10 @@ void sdWriteTask(void *pvParameters) {
                     encoderWav_record.setAudioInfo(info_WavEncoder);
                     stream_wavToFile.begin(info_WavEncoder); // WAV header must match the mono 16-bit PCM we actually write
                     wasRecording = true;
-                    Serial.println("Recording started...");
+                    if(debugFlag) Serial.println("Recording started...");
                 }
                 else {
-                    Serial.println("Failed to open file for writing!");
+                    if(debugFlag) Serial.println("Failed to open file for writing!");
                     isRecording = false; // Abort
                 }
             }
@@ -1584,7 +1598,7 @@ void sdWriteTask(void *pvParameters) {
                 audioFile_record.close();
                 wasRecording = false;
                 
-                Serial.println("Recording stopped.");
+                if(debugFlag) Serial.println("Recording stopped.");
             }
             // Sleep briefly when not recording
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1615,7 +1629,7 @@ void stopRecording() {
 
     i2s_record.end(); // uninstall i2s resources
     
-    Serial.println("[ERROR] Sending failed.");
+    if(debugFlag) Serial.println("[ERROR] Sending failed.");
     battery.subtractSend();
 }
 
@@ -1670,7 +1684,7 @@ void addTranscodeJob(const char* oggFile, const char* wavFile) {
     strncpy(newJob.inFile, oggFile, sizeof(newJob.inFile));
     strncpy(newJob.outFile, wavFile, sizeof(newJob.outFile));
     if (xQueueSend(jobQueue, &newJob, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        Serial.println("[ERROR] Failed to queue transcode job - queue full or timeout");
+        if(debugFlag) Serial.println("[ERROR] Failed to queue transcode job - queue full or timeout");
         isTranscoding = false;
     }
 }
@@ -1688,14 +1702,14 @@ void transcodeTask(void *pvParameters) {
         // Process all jobs that were enqueued during the batch.
         while (xQueueReceive(jobQueue, &job, 0) == pdPASS) {
 
-            Serial.printf("\n[Transcoder] Started: %s -> %s\n", job.inFile, job.outFile);
+            if(debugFlag) Serial.printf("\n[Transcoder] Started: %s -> %s\n", job.inFile, job.outFile);
             isTranscoding = true;
 
             audioFileIn = SD_MMC.open(job.inFile, FILE_READ);
             audioFileOut = SD_MMC.open(job.outFile, FILE_WRITE);
 
             if (!audioFileIn || !audioFileOut) {
-                Serial.println("[Transcoder] Error: Failed to open files.");
+                if(debugFlag) Serial.println("[Transcoder] Error: Failed to open files.");
                 if (audioFileIn) audioFileIn.close();
                 if (audioFileOut) audioFileOut.close();
                 continue; // Skip this job and wait for the next one
@@ -1707,7 +1721,7 @@ void transcodeTask(void *pvParameters) {
 
             // Ensure PSRAM is initialized and available
             if (!psramInit()) {
-                Serial.println("ERROR: PSRAM failed to initialize. Aborting transcoding.");
+                if(debugFlag) Serial.println("ERROR: PSRAM failed to initialize. Aborting transcoding.");
                 continue;
             }
 
@@ -1722,7 +1736,7 @@ void transcodeTask(void *pvParameters) {
             while (true) {
                 size_t bytesCopied = copier_transcode.copy();
 
-                Serial.print(".");
+                if(debugFlag) Serial.print(".");
 
                 // Handle the start-up delay and end-of-file buffer flushing
                 if (bytesCopied == 0) {
@@ -1749,11 +1763,11 @@ void transcodeTask(void *pvParameters) {
             // Remove transcoded ogg file from card
             SD_MMC.remove(job.inFile);
 
-            isTranscoding = false;
-
-            Serial.println("\n[Transcoder] Transcoding finished.");
+            if(debugFlag) Serial.println("\n[Transcoder] Transcoding finished.");
 
             resetAutoSleep();
         }
+
+        isTranscoding = false;
     }
 }
