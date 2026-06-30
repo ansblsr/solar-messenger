@@ -698,7 +698,7 @@ void handleLEDStrip() {
     
     if (showingBatteryLevel && millis() >= tp_showBatteryLevelUntil) {
 
-        if(battery_level < min(battery.cost_listen, battery.cost_send, battery.cost_update)) {
+        if(battery_level < min(battery.cost_listen, min(battery.cost_send, battery.cost_update))) {
             goToSleep();
         } else {
             showDialPositionLED(dialPosition);
@@ -719,7 +719,7 @@ void showBatteryLevelLED(int duration_ms) {
     int batteryLevel = constrain(battery_level, 0, 1000); // Stay in range to be sure
     int ledsLit = (NUM_LEDS * batteryLevel) / 1000;
 
-    if(ledsLit == 0 || battery_level < min(battery.cost_listen, battery.cost_send, battery.cost_update)) {
+    if(ledsLit == 0 || battery_level < min(battery.cost_listen, min(battery.cost_send, battery.cost_update))) {
         leds[0] = CRGB::Red;
     } else {
         // Fill from index 0 up to ledsLit with green
