@@ -10,7 +10,7 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include <FastLED.h>
-
+#include <cmath>
 
 // Bot Token, Chat-IDs, WiFi credentials
 #include "../Shared/arduino_secrets.h"
@@ -27,6 +27,7 @@ void playChatWrapper();
 void playChat(const char* chatId);
 bool isValidChat(const char* chat_id, int* printIndex_optional = nullptr);
 void chargeBattery();
+double exp_chargeFunction(double x, double X, double Y, double r);
 void measureBrightnessWrapper();
 int measureBrightness();
 void handleBehavior(unsigned long tp_now);
@@ -60,7 +61,7 @@ void indicatorFlash();
 
 // ==========================================================================================
 
-bool debugFlag = true;
+bool debugFlag = false;
 
 // POWER MANAGEMENT ============================
 
@@ -202,17 +203,18 @@ RTC_DATA_ATTR bool newMessages[max_chats] = {false};
 
 // BATTERY & SYSTEM BEHAVIOR =========================
 
-RTC_DATA_ATTR int battery_level = 650;
+RTC_DATA_ATTR float battery_level = 1000.0f;
 
 struct Battery {
 
-    int cost_send = 150;
-    int cost_update = 150;
-    int cost_listen = 30;
+    float cost_send = 225.0f;
+    float cost_update = 225.0f;
+    float cost_listen = 50.0f;
 
-    void chargeBy(int points) {
+    void chargeBy(float points) {
         battery_level += points;
-        if (battery_level > 1000) battery_level = 1000;
+        if (battery_level > 1000.0f) battery_level = 1000.0f;
+        if (battery_level < 0.0f) battery_level = 0.0f;
     }
 
     bool canSend() {
@@ -256,14 +258,17 @@ struct Battery {
 
     void subtractSend() {
         battery_level -= cost_send;
+        if (battery_level < 0.0f) battery_level = 0.0f;
     }
 
     void subtractUpdate() {
         battery_level -= cost_update;
+        if (battery_level < 0.0f) battery_level = 0.0f;
     }
 
     void subtractListen() {
         battery_level -= cost_listen;
+        if (battery_level < 0.0f) battery_level = 0.0f;
     }
 };
 
@@ -279,7 +284,7 @@ WiFiClientSecure client_wifi;
 RTC_DATA_ATTR long lastUpdateId = 0;
 i2s_chan_handle_t rx_handle = NULL;
 
-bool isDownloading = false;
+bool isProcessing = false;
 
 
 // INTERNAL COMMUNICATION =======================
@@ -298,6 +303,8 @@ bool isDownloading = false;
 
 
 // AUDIO PLAYBACK ===========================
+
+#define SD_MODE_PIN GPIO_NUM_5
 
 bool isAudioRunning = false;
 File audioFile;
@@ -416,7 +423,8 @@ void setupSensingMode() {
 
     totalMillis += INTERVAL_BATTERY_UPDATE_US / 1000; // add the time you spent sleeping
 
-    chargeBattery(); // Charge battery according to conditions
+    if(battery_level < 1000.0f) chargeBattery(); // Charge battery according to conditions
+
     handleBehavior(totalMillis); // Check if fetching should happen
 
     // Wait for any transcoding to complete before sleeping
@@ -424,7 +432,7 @@ void setupSensingMode() {
         delay(100);
     }
 
-    delay(300);
+    delay(100);
 
     goToSleep();
 }
@@ -446,6 +454,7 @@ void setupUsageMode() {
     initLEDRing();
 
     setI2SData_playback();
+    gpio_hold_dis(GPIO_NUM_5); // Disable the pin hold
 
     setNewMessageLED(newMessageIndicationPos); // Light up potential new messages
 
@@ -482,6 +491,13 @@ void goToSleep() {
     FastLED.clear();
     FastLED.show();
 
+    pinMode(SD_MODE_PIN, OUTPUT);
+    digitalWrite(SD_MODE_PIN, LOW);
+    delay(10); // Give it a moment to stabilize
+
+    gpio_hold_en(SD_MODE_PIN);
+    gpio_deep_sleep_hold_en();
+
     // Set timers to wake up
     esp_sleep_enable_timer_wakeup(INTERVAL_BATTERY_UPDATE_US); // 3 min
 
@@ -511,13 +527,14 @@ void loop() {
 
     if (wasDialMoved()) {
         selectChat(dialPosition);
+        resetAutoSleep();
     }
 
     if (wasButtonPressed()) {
         playChatWrapper();
     }
 
-    if(!isRecording && !isAudioRunning && !isTranscoding) {
+    if(!isRecording && !isAudioRunning && !isTranscoding && !isProcessing) {
         handleBehavior(totalMillis + millis());
         handleAutoSleep();
     }
@@ -589,9 +606,11 @@ void IRAM_ATTR handleEncoderISR() {
   uint8_t state = (digitalRead(CLK) << 1) | digitalRead(DT);
   uint8_t index = (lastState << 2) | state;
 
-  rawEncoder += encTable[index];
+  rawEncoder -= encTable[index];
   //rawEncoder = constrain(rawEncoder, 0, max_chats*4);
   lastState = state;
+
+  resetAutoSleep();
 }
 
 void initDial() {
@@ -719,8 +738,8 @@ void showBatteryLevelLEDWrapper() {
 void showBatteryLevelLED(int duration_ms) {
     FastLED.clear();
 
-    int batteryLevel = constrain(battery_level, 0, 1000); // Stay in range to be sure
-    int ledsLit = (NUM_LEDS * batteryLevel) / 1000;
+    float batteryLevel = constrain(battery_level, 0.0f, 1000.0f); // Stay in range to be sure
+    int ledsLit = static_cast<int>((NUM_LEDS * batteryLevel) / 1000.0f);
 
     if(ledsLit == 0 || battery_level < min(battery.cost_listen, min(battery.cost_send, battery.cost_update))) {
         leds[0] = CRGB::Red;
@@ -758,15 +777,13 @@ void indicatorFlash() {
 
 /** Looks for a new message, either already on device or fetched. For the user, this acts like it goes online everytime **/
 void lookForNewMessage() {
-    if (isRecording) return;
-    if (isTranscoding) return;
-    if (isAudioRunning) return;
+    if (isRecording || isAudioRunning || isTranscoding || isProcessing) return;
 
     digitalWrite(LED_NOTIFICATION, HIGH);
 
     if (!fetchMessages()) {
         if(debugFlag) Serial.println("[MESSAGE] No new messages :(");
-        blinkLED(2, 500, 500);
+        blinkLED(3, 100, 100);
         return;
     };
 
@@ -814,8 +831,7 @@ void playChatWrapper() {
 
 /** Play the last messages in a chat folder, transcode them if specified**/
 void playChat(const char* chatId) {
-    if (isRecording) return;
-    if (isTranscoding) return;
+    if (isRecording || isTranscoding || isProcessing) return;
     if (isAudioRunning) stopPlayback();
 
     char folderPath[24]; snprintf(folderPath, sizeof(folderPath), "/%s", chatId);
@@ -977,21 +993,49 @@ bool isValidChat(const char* chat_id, int* printIndex_optional) {
 // BATTERY & SYSTEM BEHAVIOR ============================
 
 void chargeBattery() {
-    if (battery_level < 1000) {
+    if (battery_level < 1000.0f) {
 
         int brightness = measureBrightness();
 
-        int chargeAmount = 0;
+        float chargeAmount = 0.0f;
 
-        if      (brightness < 300) chargeAmount = 0;
-        else if (brightness < 600) chargeAmount = 1; // Dim indoors (50h)
-        else if (brightness < 3000) chargeAmount = 4; // Lit indoors (12,5h)
-        else if (brightness < 3500) chargeAmount = 8; // Outdoors, brighter than brightest indoors (6,25h)
-        else chargeAmount = 16; // Bright outdoors (3,125h until full)
+        /*if(brightness > 4020) {
+            chargeAmount = 60.0f;
+        }
+        if(brightness > 200) {
+            double X = 1.0;
+            double Y = 13.0;
+            double r = 6.0;
+
+            double value = exp_chargeFunction(brightness, X, Y, r);
+
+            chargeAmount = constrain(static_cast<float>(value), static_cast<float>(X), static_cast<float>(Y));
+        }*/
+
+        if      (brightness < 120) chargeAmount = 0.0f;
+        else if (brightness < 300) chargeAmount = 2.0f; //12h
+        else if (brightness < 1200) chargeAmount = 2.7f; // 9h
+        else if (brightness < 3000) chargeAmount = 4.9f; // 5h
+        else if (brightness < 4000) chargeAmount = 13.0f; // 2h
+        else chargeAmount = 26.0f; // Direct sunlight (1h until 500)
+        
 
         battery.chargeBy(chargeAmount);
-        if(debugFlag) Serial.printf("Battery level: %d\n", battery_level);
+        if(debugFlag) Serial.printf("Charged by: %.2f; Battery level: %.2f\n", chargeAmount, battery_level);
     }
+}
+
+double exp_chargeFunction(double x, double X, double Y, double r)
+{
+    // Handle the linear case to avoid division by zero when r == 0.
+    if (std::abs(r) < 1e-9)
+    {
+        return X + (Y - X) * (x / 4095.0);
+    }
+
+    return X + (Y - X) *
+        (std::exp(r * x / 4095.0) - 1.0) /
+        (std::exp(r) - 1.0);
 }
 
 void measureBrightnessWrapper() {
@@ -1026,13 +1070,13 @@ void handleBehavior(unsigned long tp_now) {
     }
 
     // Every hour, if no new messages indicated, if enough battery -> look for a new message to indicate
-    else if (
+    /*else if (
         newMessageIndicationPos == -1 &&
-        timeSinceLastFetch > 3600000 /*1h*/ && 
+        timeSinceLastFetch > 3600000 && // 1h
         battery_level >= 600
     ){
         lookForNewMessage();
-    }
+    }*/
 }
 
 void handleAutoSleep() {
@@ -1080,9 +1124,12 @@ bool fetchMessages() {
 bool processTelegramUpdates() {
 
     bool ret = false;
+    isProcessing = true;
 
     // ensure WiFi connection
     if (!tryConnectWiFi(30000)) return false;
+
+    digitalWrite(LED_NOTIFICATION, true);
 
     if(debugFlag) Serial.println("Telegram API: /getUpdates");
 
@@ -1107,7 +1154,7 @@ bool processTelegramUpdates() {
             }
 
             // ensure SD card initialized
-            if (!initSDCard()) return false; // trying it here to maybe fix ordering bug...
+            if (!initSDCard()) return false;
 
             // For every new message
             for (JsonObject currentResult : results) {
@@ -1153,8 +1200,6 @@ bool processTelegramUpdates() {
                     char oggPath[64];
                     snprintf(oggPath, sizeof(oggPath), "%s/received_%03d.ogg", folderPath, fileIndex);
 
-                    isDownloading = true;
-
                     // Download Opus/OGG file
                     if (downloadTelegramFile(fileId, oggPath)) {
                         newMessages[chatIndex] = true; // remember this chat has new, unlistened messages
@@ -1197,9 +1242,13 @@ bool processTelegramUpdates() {
     delay(500);
     disconnectWiFi();
 
+    digitalWrite(LED_NOTIFICATION, false);
+
     // allow transcoder task to start after all downloads are finished
-    isDownloading = false;
     xSemaphoreGive(startTranscodeGate);
+
+    delay(100);
+    isProcessing = false;
 
     return ret;
 }
@@ -1277,6 +1326,8 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
 
     tryConnectWiFi(30000); // ensure WiFi connection
 
+    digitalWrite(LED_NOTIFICATION, true);
+
     File f = SD_MMC.open(filePath);
     if (!f) {
         if(debugFlag) Serial.println("[ERROR] Could not open file for upload");
@@ -1326,7 +1377,7 @@ void sendWavFile(const char* filePath, const char* fileName, const char* chat_id
     client_upload.stop();
     if(debugFlag) Serial.printf("Senden beendet. %s\n", chat_id);
 
-    blinkLED(1, 500, 500);
+    blinkLED(2, 500, 500);
 
     delay(500);
     disconnectWiFi();
@@ -1345,11 +1396,13 @@ bool tryConnectWiFi(int timeout_ms) {
     bool led_blink = false;
     while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout_ms) {
         if(debugFlag) Serial.print(".");
-        //led_blink = !led_blink;
-        //digitalWrite(LED_NOTIFICATION, led_blink);
+        led_blink = !led_blink;
+        digitalWrite(LED_NOTIFICATION, led_blink);
 
         delay(500);
     }
+
+    digitalWrite(LED_NOTIFICATION, false);
 
     if (WiFi.status() != WL_CONNECTED) {
         if(debugFlag) Serial.println("\n[ERROR] WiFi connection failed (Timeout).");
@@ -1402,8 +1455,7 @@ void disconnectWiFi() {
 // AUDIO PLAYBACK ==============================================
 
 void startPlayback(const char* filePath) {
-    if (isRecording) return;
-    if (isTranscoding) return;
+    if (isRecording || isTranscoding || isProcessing) return;
     if (isAudioRunning) stopPlayback();
     
     audioFile = SD_MMC.open(filePath);
