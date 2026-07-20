@@ -203,13 +203,13 @@ RTC_DATA_ATTR bool newMessages[max_chats] = {false};
 
 // BATTERY & SYSTEM BEHAVIOR =========================
 
-RTC_DATA_ATTR float battery_level = 1000.0f;
+RTC_DATA_ATTR float battery_level = 500.0f;
 
 struct Battery {
 
-    float cost_send = 225.0f;
-    float cost_update = 225.0f;
-    float cost_listen = 50.0f;
+    float cost_send = 110.0f; //formerly 225.0f;
+    float cost_update = 110.0f; //formerly 225.0f;
+    float cost_listen = 40.0f;
 
     void chargeBy(float points) {
         battery_level += points;
@@ -296,7 +296,6 @@ bool isProcessing = false;
 #define I2S_LRC   10
 
 // SD Card Pins (SDMMC)
-#define SD_CS     14
 #define SD_CLK    39
 #define SD_CMD    38
 #define SD_D0     40
@@ -304,7 +303,10 @@ bool isProcessing = false;
 
 // AUDIO PLAYBACK ===========================
 
-#define SD_MODE_PIN GPIO_NUM_5
+// Use a dedicated GPIO for the amplifier enable line.
+// GPIO 14 is a poor choice here because it is easy to get pulled around by
+// boot/SD-related behavior on many ESP32 setups.
+#define AMP_ENABLE_PIN GPIO_NUM_18
 
 bool isAudioRunning = false;
 File audioFile;
@@ -384,6 +386,13 @@ StreamCopy copier_transcode(stream_WavToFileOut, stream_OggToFileIn, 16384);
 
 // SETUP & LOOP =======================
 
+void setAmpEnabled(bool enabled) {
+    pinMode(AMP_ENABLE_PIN, OUTPUT);
+    digitalWrite(AMP_ENABLE_PIN, enabled ? HIGH : LOW);
+    gpio_hold_dis(AMP_ENABLE_PIN);
+    delay(1);
+}
+
 // Wake up and figure out what to do
 void setup() {
     Serial.begin(115200);
@@ -454,7 +463,7 @@ void setupUsageMode() {
     initLEDRing();
 
     setI2SData_playback();
-    gpio_hold_dis(GPIO_NUM_5); // Disable the pin hold
+    setAmpEnabled(true);
 
     setNewMessageLED(newMessageIndicationPos); // Light up potential new messages
 
@@ -491,11 +500,10 @@ void goToSleep() {
     FastLED.clear();
     FastLED.show();
 
-    pinMode(SD_MODE_PIN, OUTPUT);
-    digitalWrite(SD_MODE_PIN, LOW);
+    setAmpEnabled(false);
     delay(10); // Give it a moment to stabilize
 
-    gpio_hold_en(SD_MODE_PIN);
+    gpio_hold_en(AMP_ENABLE_PIN);
     gpio_deep_sleep_hold_en();
 
     // Set timers to wake up
@@ -1014,10 +1022,10 @@ void chargeBattery() {
 
         if      (brightness < 120) chargeAmount = 0.0f;
         else if (brightness < 300) chargeAmount = 2.0f; //12h
-        else if (brightness < 1200) chargeAmount = 2.7f; // 9h
-        else if (brightness < 3000) chargeAmount = 4.9f; // 5h
-        else if (brightness < 4000) chargeAmount = 13.0f; // 2h
-        else chargeAmount = 26.0f; // Direct sunlight (1h until 500)
+        else if (brightness < 1200) chargeAmount = 2.7f; // 9h // now 4:48h
+        else if (brightness < 3000) chargeAmount = 4.4f; // 5h // now 3:00h
+        else if (brightness < 4000) chargeAmount = 13.0f; // 2h // now 1:00h
+        else chargeAmount = 26.0f; // Direct sunlight (1h until 500) // now 0:30h
         
 
         battery.chargeBy(chargeAmount);
@@ -1457,6 +1465,8 @@ void disconnectWiFi() {
 void startPlayback(const char* filePath) {
     if (isRecording || isTranscoding || isProcessing) return;
     if (isAudioRunning) stopPlayback();
+
+    digitalWrite(AMP_ENABLE_PIN, HIGH);
     
     audioFile = SD_MMC.open(filePath);
     if (!audioFile) {
